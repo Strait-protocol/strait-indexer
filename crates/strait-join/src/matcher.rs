@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use strait_core::{
     config::{BTC_DEPOSIT_MATCH_WINDOW_SECS, ETH_DEPOSIT_MATCH_WINDOW_SECS},
     events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent},
-    types::{BitcoinTxid, Address},
+    types::BitcoinTxid,
 };
 
 /// Configuration for matching behavior.
@@ -397,7 +397,7 @@ mod tests {
     use chrono::Utc;
     use strait_core::{
         events::BitcoinEvent,
-        types::{Asset, BitcoinAddress, BitcoinTxid, BlockHash, TxHash},
+        types::{Address, Asset, BitcoinAddress, BitcoinTxid, BlockHash, TxHash},
     };
 
     fn make_btc_deposit(txid_bytes: [u8; 32], addr: &str, amount_sats: u64) -> RawEvent {
@@ -407,6 +407,7 @@ mod tests {
             to_address: BitcoinAddress::new(addr),
             amount_sats,
             op_return_data: None,
+            hemi_destination: None,
             block_number: 100,
             block_hash: BlockHash([0; 32]),
             block_time: Utc::now(),
@@ -421,7 +422,9 @@ mod tests {
             to,
             source_txid,
             block_number: 200,
+            block_time: Utc::now(),
             log_index: 0,
+            gas_fee: None,
         })
     }
 

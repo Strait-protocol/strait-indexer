@@ -61,10 +61,9 @@ impl<'a> CheckpointRepo<'a> {
             INSERT INTO checkpoints (chain, block_height, block_hash)
             VALUES ($1, $2, $3)
             ON CONFLICT (chain) DO UPDATE
-            SET block_height = EXCLUDED.block_height,
-                block_hash = EXCLUDED.block_hash,
-                updated_at = NOW()
-            WHERE checkpoints.block_height < EXCLUDED.block_height
+            SET block_height = GREATEST(checkpoints.block_height, EXCLUDED.block_height),
+                block_hash   = EXCLUDED.block_hash,
+                updated_at   = NOW()
             RETURNING *
             "#
         )
@@ -124,5 +123,65 @@ mod tests {
         assert_eq!(chain_to_string(Chain::Bitcoin), "bitcoin");
         assert_eq!(chain_to_string(Chain::Ethereum), "ethereum");
         assert_eq!(chain_to_string(Chain::Hemi), "hemi");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL; verifies checkpoint persistence/resume against a live DB"]
+    async fn db_checkpoint_persist_and_resume() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("DATABASE_URL not set — skipping");
+            return;
+        };
+        let db = crate::init_database(&url).await.expect("connect + migrate");
+        let repo = CheckpointRepo::new(&db);
+        let _ = repo.delete(Chain::Hemi).await;
+        let _ = repo.delete(Chain::Ethereum).await;
+
+        // First persist.
+        repo.upsert(UpsertCheckpoint {
+            chain: Chain::Hemi,
+            block_height: 100,
+            block_hash: "0xaaa".into(),
+        })
+        .await
+        .unwrap();
+        let cp = repo.get(Chain::Hemi).await.unwrap().unwrap();
+        assert_eq!(cp.chain, "hemi");
+        assert_eq!(cp.block_height, 100);
+
+        // Advance.
+        repo.upsert(UpsertCheckpoint {
+            chain: Chain::Hemi,
+            block_height: 250,
+            block_hash: "0xbbb".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(repo.get(Chain::Hemi).await.unwrap().unwrap().block_height, 250);
+
+        // A lower height must not regress the checkpoint (GREATEST).
+        repo.upsert(UpsertCheckpoint {
+            chain: Chain::Hemi,
+            block_height: 200,
+            block_hash: "0xccc".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(repo.get(Chain::Hemi).await.unwrap().unwrap().block_height, 250);
+
+        // Hemi and Ethereum are tracked independently.
+        repo.upsert(UpsertCheckpoint {
+            chain: Chain::Ethereum,
+            block_height: 7,
+            block_hash: "0xeee".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(repo.get(Chain::Ethereum).await.unwrap().unwrap().block_height, 7);
+        assert_eq!(repo.get(Chain::Hemi).await.unwrap().unwrap().block_height, 250);
+
+        repo.delete(Chain::Hemi).await.unwrap();
+        repo.delete(Chain::Ethereum).await.unwrap();
+        eprintln!("DB checkpoint persist/resume OK");
     }
 }

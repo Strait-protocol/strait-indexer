@@ -17,8 +17,12 @@ strait-evm = { path = "../strait-evm" }
 strait-join = { path = "../strait-join" }
 strait-store = { path = "../strait-store" }
 strait-api = { path = "../strait-api" }
+alloy = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }

@@ -42,10 +42,13 @@ pub struct EvmChainConfig {
     pub rpc_url: String,
     /// Chain ID (43111 for Hemi mainnet, 743111 for Hemi testnet, 1 for Ethereum mainnet, 11155111 for Sepolia)
     pub chain_id: u64,
-    /// Tunnel contract address (checksummed).
-    /// For ETH/ERC-20 routes: L2StandardBridge (0x4200000000000000000000000000000000000010 on Hemi).
-    /// For BTC routes: the Hemi Bitcoin tunnel contract (address TBC — FIXME: confirm with Hemi docs).
+    /// ETH/ERC-20 tunnel contract — L2StandardBridge (0x4200…0010 on Hemi),
+    /// L1StandardBridgeProxy on Ethereum.
     pub tunnel_contract: String,
+    /// BTC tunnel contract — BitcoinTunnelManager on Hemi (emits DepositConfirmed /
+    /// WithdrawalInitiated). Watched in addition to `tunnel_contract`. None on Ethereum.
+    #[serde(default)]
+    pub btc_tunnel_contract: Option<String>,
     /// BitcoinKit precompile address on Hemi.
     /// Mainnet: 0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12 (v1)
     /// Testnet: 0xeC9fa5daC1118963933e1A675a4EEA0009b7f215 (v0)
@@ -154,51 +157,101 @@ fn default_api_port() -> u16 {
 }
 
 // ============================================================================
+// Environment helpers
+// ============================================================================
+
+/// Read an environment variable as a String, empty if unset.
+fn env_str(key: &str) -> String {
+    std::env::var(key).unwrap_or_default()
+}
+
+/// Read an environment variable as `Some(String)`, `None` if unset or empty.
+fn env_opt(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Read and parse an environment variable, falling back to `default` if unset
+/// or unparseable.
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+// ============================================================================
 // Configuration loading
 // ============================================================================
 
 impl AppConfig {
-    /// Load configuration from environment variables and .env file
+    /// Load configuration from environment variables (with `.env` fallback).
+    ///
+    /// Reads the flat, conventionally-named variables documented in `.env.example`
+    /// (e.g. `HEMI_RPC_URL`, `DATABASE_URL`, `BITCOIN_TUNNEL_ADDRESSES`). Optional
+    /// values fall back to the defaults defined in this module.
     pub fn load() -> Result<Self> {
         // Load .env file if it exists (ignore if not found)
         let _ = dotenvy::dotenv();
 
-        let config = config::Config::builder()
-            // Bitcoin
-            .set_default(
-                "bitcoin.confirmation_depth",
-                default_bitcoin_confirmation_depth(),
-            )?
-            .set_default(
-                "bitcoin.poll_interval_secs",
-                default_bitcoin_poll_interval(),
-            )?
-            // Hemi
-            .set_default("hemi.start_block", default_start_block())?
-            .set_default("hemi.confirmation_depth", 3u32)? // Hemi has faster finality
-            .set_default("hemi.poll_interval_ms", default_evm_poll_interval())?
-            // Ethereum
-            .set_default("ethereum.start_block", default_start_block())?
-            .set_default(
-                "ethereum.confirmation_depth",
-                default_evm_confirmation_depth(),
-            )?
-            .set_default("ethereum.poll_interval_ms", default_evm_poll_interval())?
-            // Database
-            .set_default("database.max_connections", default_max_connections())?
-            // API
-            .set_default("api.host", default_api_host())?
-            .set_default("api.port", default_api_port())?
-            // Load from environment
-            .add_source(config::Environment::with_prefix("STRAIT").separator("__"))
-            .build()?;
-
-        let app_config: AppConfig = config.try_deserialize()?;
+        let config = AppConfig {
+            bitcoin: BitcoinConfig {
+                rpc_url: env_str("BITCOIN_RPC_URL"),
+                rpc_user: env_str("BITCOIN_RPC_USER"),
+                rpc_password: env_str("BITCOIN_RPC_PASSWORD"),
+                tunnel_addresses: env_str("BITCOIN_TUNNEL_ADDRESSES")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                confirmation_depth: env_parse(
+                    "BITCOIN_CONFIRMATION_DEPTH",
+                    default_bitcoin_confirmation_depth(),
+                ),
+                poll_interval_secs: env_parse(
+                    "BITCOIN_POLL_INTERVAL_SECS",
+                    default_bitcoin_poll_interval(),
+                ),
+            },
+            hemi: EvmChainConfig {
+                rpc_url: env_str("HEMI_RPC_URL"),
+                chain_id: env_parse("HEMI_CHAIN_ID", 43111),
+                tunnel_contract: env_str("HEMI_TUNNEL_CONTRACT"),
+                btc_tunnel_contract: env_opt("HEMI_BTC_TUNNEL_CONTRACT"),
+                bitcoin_kit_contract: env_opt("HEMI_BITCOIN_KIT_CONTRACT"),
+                start_block: env_parse("HEMI_START_BLOCK", default_start_block()),
+                confirmation_depth: env_parse(
+                    "HEMI_CONFIRMATION_DEPTH",
+                    HEMI_CONFIRMATION_DEPTH,
+                ),
+                poll_interval_ms: env_parse("HEMI_POLL_INTERVAL_MS", default_evm_poll_interval()),
+            },
+            ethereum: EvmChainConfig {
+                rpc_url: env_str("ETH_RPC_URL"),
+                chain_id: env_parse("ETH_CHAIN_ID", 1),
+                tunnel_contract: env_str("ETH_TUNNEL_CONTRACT"),
+                btc_tunnel_contract: None,
+                bitcoin_kit_contract: None,
+                start_block: env_parse("ETH_START_BLOCK", default_start_block()),
+                confirmation_depth: env_parse(
+                    "ETH_CONFIRMATION_DEPTH",
+                    default_evm_confirmation_depth(),
+                ),
+                poll_interval_ms: env_parse("ETH_POLL_INTERVAL_MS", default_evm_poll_interval()),
+            },
+            database: DatabaseConfig {
+                url: env_str("DATABASE_URL"),
+                max_connections: env_parse("DATABASE_MAX_CONNECTIONS", default_max_connections()),
+            },
+            api: ApiConfig {
+                host: env_opt("API_HOST").unwrap_or_else(default_api_host),
+                port: env_parse("API_PORT", default_api_port()),
+            },
+        };
 
         // Validate required fields
-        app_config.validate()?;
+        config.validate()?;
 
-        Ok(app_config)
+        Ok(config)
     }
 
     /// Validate that all required configuration is present
@@ -283,6 +336,7 @@ mod tests {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
                 chain_id: 743111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                btc_tunnel_contract: Some("0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e".to_string()),
                 bitcoin_kit_contract: Some("0xeC9fa5daC1118963933e1A675a4EEA0009b7f215".to_string()),
                 start_block: 0,
                 confirmation_depth: 3,
@@ -292,6 +346,7 @@ mod tests {
                 rpc_url: "https://eth-sepolia.g.alchemy.com/v2/test".to_string(),
                 chain_id: 11155111,
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                btc_tunnel_contract: None,
                 bitcoin_kit_contract: None,
                 start_block: 0,
                 confirmation_depth: 12,

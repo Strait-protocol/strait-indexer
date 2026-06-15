@@ -8,6 +8,7 @@ description = "Join engine for cross-chain event matching and state machine"
 
 [dependencies]
 strait-core = { path = "../strait-core" }
+strait-store = { path = "../strait-store" }
 tokio = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }

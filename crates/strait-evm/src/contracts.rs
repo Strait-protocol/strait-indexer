@@ -591,10 +591,10 @@ mod tests {
             topics::eth_bridge_initiated(),
             topics::erc20_bridge_finalized(),
             topics::erc20_bridge_initiated(),
-            topics::tunnel_in(),
-            topics::tunnel_out(),
-            topics::tunnel_out_complete(),
-            topics::pop_submitted(),
+            topics::deposit_confirmed(),
+            topics::btc_withdrawal_initiated(),
+            topics::vault_created(),
+            topics::payout_round_executed(),
         ];
         for i in 0..selectors.len() {
             for j in (i + 1)..selectors.len() {
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn test_topic_selectors_are_deterministic() {
         assert_eq!(topics::eth_bridge_finalized(), topics::eth_bridge_finalized());
-        assert_eq!(topics::tunnel_in(), topics::tunnel_in());
+        assert_eq!(topics::deposit_confirmed(), topics::deposit_confirmed());
     }
 
     #[test]
@@ -620,5 +620,28 @@ mod tests {
     fn test_invalid_txid_rejected() {
         assert!(txid_to_bytes32("invalid").is_err());
         assert!(txid_to_bytes32("0123456789abcdef").is_err()); // too short
+    }
+
+    #[test]
+    fn test_recover_btc_address_from_initiate_withdrawal_calldata() {
+        use alloy::sol_types::SolCall;
+        // Real Hemi-mainnet initiateWithdrawal(uint32,string,uint256) calldata.
+        // The btcAddress is `indexed` (keccak-hashed) in the WithdrawalInitiated event,
+        // but the originating call carries it in cleartext — this proves we can recover it.
+        let calldata = hex::decode(concat!(
+            "6fff6d2e",
+            "0000000000000000000000000000000000000000000000000000000000000006",
+            "0000000000000000000000000000000000000000000000000000000000000060",
+            "00000000000000000000000000000000000000000000000000000000000927c0",
+            "000000000000000000000000000000000000000000000000000000000000002a",
+            "6263317177716c3261756a32753536736b38376e327038673436346e6e737770",
+            "367161726b637935746b00000000000000000000000000000000000000000000",
+        ))
+        .unwrap();
+        let decoded =
+            IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(&calldata, false).unwrap();
+        assert_eq!(decoded.vaultIndex, 6);
+        assert_eq!(decoded.btcAddress, "bc1qwql2auj2u56sk87n2p8g464nnswp6qarkcy5tk");
+        assert_eq!(decoded.amount, alloy::primitives::U256::from(600_000u64));
     }
 }

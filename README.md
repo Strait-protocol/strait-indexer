@@ -2,7 +2,7 @@
 
 **Real-time, reorg-safe tunnel indexer for Hemi Network.**
 
-Strait tracks assets moving through Hemi's trust-minimized bridges between Bitcoin, Hemi, and Ethereum. It ingests all three chains, joins related events into unified `TunnelTransfer` records with complete lifecycles, and serves that data via GraphQL and webhooks.
+Strait tracks assets moving through Hemi's trust-minimized bridges between Bitcoin, Hemi, and Ethereum. It ingests all three chains, joins related events into unified `TunnelTransfer` records with complete lifecycles — including **Bitcoin-anchored finality** via Hemi's PoP keystones — and serves that data via REST, GraphQL, and a web dashboard.
 
 ---
 
@@ -13,7 +13,7 @@ A complete tunnel flow touches at least three blockchains — each with differen
 1. **Ingest** raw events from Bitcoin, Hemi, and Ethereum independently and concurrently
 2. **Join** related cross-chain events into a single `TunnelTransfer` record using a stateful engine
 3. **Track lifecycle** — `INITIATED → ANCHORED → FINALIZED` — with explicit handling for reorgs and failures
-4. **Serve** the unified dataset via GraphQL queries, real-time webhooks, and a complete audit log
+4. **Serve** the unified dataset via REST + GraphQL and a web dashboard, with a complete audit log
 
 Supported tunnel routes:
 
@@ -23,6 +23,29 @@ Supported tunnel routes:
 | `HEMI_TO_BTC` | Out | `WithdrawalInitiated` on Hemi → BTC payout by vault operator |
 | `ETH_TO_HEMI` | In | Ethereum `ETHBridgeInitiated` → Hemi `ETHBridgeFinalized` |
 | `HEMI_TO_ETH` | Out | Hemi `ETHBridgeInitiated` → Ethereum release |
+
+---
+
+## Project Status
+
+Strait runs end-to-end today: a single `strait-node` binary ingests Hemi + Ethereum
+(and Bitcoin via BitcoinKit), joins events into `TunnelTransfer` records, persists them
+to Postgres/Supabase, and serves them over REST + GraphQL with a web dashboard on top.
+
+| Area | Status |
+|---|---|
+| Hemi + Ethereum EVM ingesters (live, reorg-aware) | ✅ Built |
+| Join engine — `TunnelTransfer` lifecycle, PoP anchoring | ✅ Built |
+| Bitcoin custody watcher (BitcoinKit, OP_RETURN decode) | ✅ Built (opt-in via custody addresses) |
+| Postgres/Supabase persistence + auto-migrations | ✅ Built |
+| Checkpointing / resumability / historical backfill | ✅ Built |
+| REST (`/transfers`) + GraphQL (`/graphql`) API | ✅ Built |
+| Web dashboard (Next.js tunnel explorer + finality timeline) | ✅ Built |
+| Webhooks (push notifications) | 🚧 Planned |
+| Vault auto-discovery for the BTC watch-set | 🚧 Planned |
+
+The GraphQL schema and setup steps documented below reflect what is **actually
+implemented**. Sections marked _Planned_ are design targets, not yet shipped.
 
 ---
 
@@ -58,11 +81,12 @@ All addresses confirmed from the Hemi explorer and the [`hemilabs/bitcoin-tunnel
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  GraphQL API (/graphql)  │  Webhooks  │  GraphiQL Playground│
+│  REST (/transfers)  │  GraphQL (/graphql + GraphiQL)  │  Web │
+│                                                    dashboard │
 └─────────────────────────────────────────────────────────────┘
                              │
 ┌─────────────────────────────────────────────────────────────┐
-│  Postgres (hot path)  ←  strait-store                       │
+│  Postgres / Supabase  ←  strait-store                       │
 └─────────────────────────────────────────────────────────────┘
                              │
 ┌─────────────────────────────────────────────────────────────┐
@@ -90,7 +114,7 @@ All addresses confirmed from the Hemi explorer and the [`hemilabs/bitcoin-tunnel
 | `strait-evm` | EVM ingester — handles both `BitcoinTunnelManager` (BTC) and `L2StandardBridge` (ETH/ERC-20) events |
 | `strait-join` | Join engine — per-route state machine, cross-chain event matching, reorg retraction |
 | `strait-store` | Database layer — SQLx/Postgres CRUD for transfers, events, proofs, checkpoints |
-| `strait-api` | GraphQL server (async-graphql + axum) and HMAC-signed webhook dispatcher |
+| `strait-api` | HTTP API — REST (`/transfers`) + GraphQL (`/graphql`, GraphiQL) on axum + async-graphql |
 | `strait-node` | Binary entrypoint — wires all crates together, manages task lifecycle |
 
 ---
@@ -290,203 +314,78 @@ Release confirmed on Ethereum
 
 ### GraphQL
 
-Served at `http://localhost:8080/graphql`. GraphiQL playground at `http://localhost:8080/` in development.
-
-**Query by Strait transfer ID:**
+Served at `http://localhost:8080/graphql`, with an interactive **GraphiQL** playground at
+the same URL in a browser. Field names are camelCase. This is the schema as implemented:
 
 ```graphql
-query {
-  tunnelTransfer(id: "550e8400-e29b-41d4-a716-446655440000") {
-    id
-    route
-    asset
-    amount
-    status
-    initiatedAt
-    finalizedAt
-    sourceTx { chain hash blockNumber confirmations }
-    destinationTx { chain hash blockNumber }
-    reorgEvents { chain depth affectedFromBlock detectedAt }
+type Query {
+  transfers(limit: Int = 50, offset: Int = 0): [Transfer!]!
+  transfer(id: UUID!): Transfer
+  transfersByRecipient(recipient: String!, limit: Int = 50, offset: Int = 0): [Transfer!]!
+  stats: Stats!
+}
+
+type Transfer {
+  id: UUID!
+  asset: String!            # BTC | ETH | ERC20
+  direction: String!        # IN | OUT
+  route: String!            # BTC_TO_HEMI | HEMI_TO_BTC | ETH_TO_HEMI | HEMI_TO_ETH
+  amount: String!           # atomic units (sats for BTC, wei for ETH)
+  sender: String!
+  recipient: String!
+  status: String!           # INITIATED | ANCHORED | FINALIZED | FAILED | REORGED
+  sourceChain: String!
+  sourceTxHash: String!
+  sourceBlock: Int!
+  sourceTimestamp: DateTime!
+  destChain: String
+  destTxHash: String
+  destBlock: Int
+  popAnchored: Boolean!     # anchored to Bitcoin via PoP keystone
+  popKeystoneBlock: Int
+  popScore: Int
+  popAnchoredAt: DateTime
+  initiatedAt: DateTime!
+  finalizedAt: DateTime
+}
+
+type Stats { totalTransfers: Int! }
+```
+
+**Recent transfers:**
+
+```graphql
+{
+  transfers(limit: 10) {
+    id route asset amount status popAnchored popKeystoneBlock
+    sourceChain sourceBlock destChain destBlock
   }
 }
 ```
 
-**Query by Bitcoin deposit txid (BTC→Hemi):**
-
-The `depositTxId` from the `DepositConfirmed` event is the join key for BTC→Hemi transfers. Query by it directly:
+**One transfer by id:**
 
 ```graphql
-query {
-  tunnelTransfers(
-    filter: {
-      route: BTC_TO_HEMI
-      sourceTxHash: "a3f7c2d1e8b4f6a9c0d2e5f8b1a4c7d0e3f6a9b2c5d8e1f4a7b0c3d6e9f2a5b8"
-    }
-    first: 1
-  ) {
-    edges {
-      node {
-        id
-        amount
-        status
-        sourceTx { hash blockNumber }   # Bitcoin deposit tx
-        destinationTx { hash }          # Hemi DepositConfirmed tx
-      }
-    }
-  }
-}
+{ transfer(id: "5eed0001-0000-4000-8000-000000000001") {
+    route amount status popAnchored popKeystoneBlock popScore
+    sourceTxHash destTxHash finalizedAt
+} }
 ```
 
-**Query by withdrawal UUID (Hemi→BTC):**
-
-The `uuid` from `WithdrawalInitiated` is the cross-chain join key for Hemi→BTC withdrawals. It encodes `(vaultIndex << 32 | vaultSpecificUUID)`:
+**A wallet's transfers (e.g. "show my bridges"):**
 
 ```graphql
-query {
-  tunnelTransfers(
-    filter: {
-      route: HEMI_TO_BTC
-      withdrawalUuid: "4294967297"   # decimal string — vaultIndex=1, vaultUUID=1
-    }
-    first: 1
-  ) {
-    edges {
-      node {
-        id
-        amount
-        status
-        sourceTx { hash blockNumber }   # Hemi WithdrawalInitiated tx
-        destinationTx { hash }          # Bitcoin payout tx (null until operator pays)
-        initiatedAt
-        finalizedAt
-      }
-    }
-  }
-}
+{ transfersByRecipient(recipient: "0xab...") { route asset amount status } }
 ```
 
-You can also decompose a uuid yourself:
+The REST endpoint `GET /transfers?limit=&offset=` returns the same records as JSON, and
+`GET /health` is a liveness probe.
 
-```bash
-# uuid = 8589934594
-vault_index=$((8589934594 >> 32))       # = 2
-vault_uuid=$((8589934594 & 0xFFFFFFFF)) # = 2
-```
+### Webhooks _(planned)_
 
-**List active withdrawals for a wallet (monitoring vault operator):**
-
-```graphql
-query PendingWithdrawals {
-  tunnelTransfers(
-    filter: {
-      route: HEMI_TO_BTC
-      status: INITIATED            # operator has not yet paid
-      sender: "0xYourWalletAddress"
-    }
-    first: 50
-  ) {
-    edges {
-      node {
-        id
-        amount
-        initiatedAt
-        sourceTx { hash }
-      }
-    }
-  }
-}
-```
-
-**Filter by vault address (operator view):**
-
-```graphql
-query VaultDeposits {
-  tunnelTransfers(
-    filter: {
-      route: BTC_TO_HEMI
-      vaultAddress: "0xVaultContractAddress"
-      status: FINALIZED
-    }
-    first: 100
-  ) {
-    edges {
-      node { id amount initiatedAt finalizedAt }
-    }
-  }
-}
-```
-
-**Aggregate stats:**
-
-```graphql
-query {
-  tunnelStats(window: LAST_7D) {
-    totalVolumeUsd
-    transferCount
-    averageFinalitySecs
-    activeTransfers
-  }
-}
-```
-
-**Cursor-paginated list:**
-
-```graphql
-query {
-  tunnelTransfers(
-    filter: {
-      route: BTC_TO_HEMI
-      status: FINALIZED
-      amountGte: "1000000"         # 0.01 BTC in satoshis
-      initiatedAfter: "2025-03-12T00:00:00Z"
-    }
-    first: 20
-    after: "cursor-from-previous-page"
-  ) {
-    edges {
-      node { id amount status initiatedAt }
-      cursor
-    }
-    pageInfo { hasNextPage endCursor }
-  }
-}
-```
-
-### Webhooks
-
-Register a webhook to receive real-time push notifications:
-
-```bash
-curl -X POST http://localhost:8080/webhooks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://your-endpoint.example.com/hooks/strait",
-    "secret": "your-hmac-signing-secret",
-    "filter": {
-      "routes": ["BTC_TO_HEMI"],
-      "assets": ["BTC"],
-      "statusTransitions": ["FINALIZED"],
-      "minAmount": "100000000"
-    }
-  }'
-```
-
-Every delivery is signed with `HMAC-SHA256(secret, body)` in the `X-Strait-Signature` header. Deliveries retry up to 5 times with exponential backoff.
-
-**Watch for failed withdrawals (operator not paying):**
-
-```bash
-curl -X POST http://localhost:8080/webhooks \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://your-bot.example.com/hooks/strait",
-    "secret": "secret",
-    "filter": {
-      "routes": ["HEMI_TO_BTC"],
-      "statusTransitions": ["FAILED"]
-    }
-  }'
-```
+Push notifications (HMAC-signed delivery, filtered by route/asset/status) are on the
+roadmap but **not yet implemented**. Until then, poll `GET /transfers` or the GraphQL
+`transfers` query.
 
 ---
 
@@ -495,64 +394,66 @@ curl -X POST http://localhost:8080/webhooks \
 ### Prerequisites
 
 - **Rust** 1.75+ (2021 edition)
-- **PostgreSQL** 14+
-- **Bitcoin full node** with RPC enabled (or Bitcoin testnet node)
-- **Hemi RPC endpoint** — testnet: `https://testnet.rpc.hemi.network/rpc`
-- **Ethereum RPC endpoint** — e.g. Alchemy or Infura (Sepolia for testnet)
-- [`sqlx-cli`](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli)
+- **PostgreSQL 14+** — local, or a hosted **Supabase** project (see [`docs/supabase-setup.md`](docs/supabase-setup.md)). Migrations run automatically on startup; no `sqlx-cli` needed.
+- **Hemi RPC endpoint** — mainnet `https://rpc.hemi.network/rpc` (keyless), testnet `https://testnet.rpc.hemi.network/rpc`
+- **Ethereum RPC endpoint** — a keyless public node works (`https://ethereum-rpc.publicnode.com`), or your own Alchemy/Infura URL
+- **Node.js 20+** — only if you want to run the dashboard
+- A **Bitcoin node is optional** — Bitcoin state is read through the BitcoinKit precompile on Hemi
 
-### Quick start (testnet)
+### Quick start
 
 ```bash
-git clone https://github.com/strait-data/strait
+git clone https://github.com/Godbrand0/strait
 cd strait && cp .env.example .env
 ```
 
-Edit `.env` — all testnet addresses are pre-filled:
+Edit `.env` — the defaults target **Hemi mainnet** (keyless) and a keyless Ethereum node,
+so the only value you must set is `DATABASE_URL`:
 
 ```bash
-# Hemi testnet
-HEMI_RPC_URL=https://testnet.rpc.hemi.network/rpc
-HEMI_CHAIN_ID=743111
-HEMI_TUNNEL_CONTRACT=0x4200000000000000000000000000000000000010
-HEMI_BTC_TUNNEL_CONTRACT=0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e
-HEMI_BITCOIN_KIT_CONTRACT=0xeC9fa5daC1118963933e1A675a4EEA0009b7f215
-HEMI_START_BLOCK=0
-HEMI_CONFIRMATION_DEPTH=3
+# Local Postgres:
+DATABASE_URL=postgres://postgres:password@localhost:5432/strait?sslmode=disable
+# …or a Supabase Session-pooler URL (see docs/supabase-setup.md):
+# DATABASE_URL=postgres://postgres.<ref>:<pw>@aws-<n>-<region>.pooler.supabase.com:5432/postgres?sslmode=require
 
-# Ethereum Sepolia
-ETH_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-ETH_CHAIN_ID=11155111
-ETH_TUNNEL_CONTRACT=0xc94b1BEe63A3e101FE5F71C80F912b4F4b055925
-ETH_CONFIRMATION_DEPTH=12
+HEMI_RPC_URL=https://rpc.hemi.network/rpc       # keyless
+ETH_RPC_URL=https://ethereum-rpc.publicnode.com  # keyless (swap in your own for production)
 
-# Bitcoin (optional — BitcoinKit covers most use cases)
-BITCOIN_RPC_URL=http://localhost:8332
-BITCOIN_RPC_USER=user
-BITCOIN_RPC_PASSWORD=password
-BITCOIN_CONFIRMATION_DEPTH=6
-
-# Database
-DATABASE_URL=postgres://postgres:password@localhost:5432/strait
-
-# API
-API_HOST=0.0.0.0
-API_PORT=8080
+# Leave empty to disable the Bitcoin custody watcher (BTC deposits are still
+# captured via Hemi's DepositConfirmed event). Add real vault custody addresses to enable it.
+BITCOIN_TUNNEL_ADDRESSES=
 ```
+
+Then run the node — it connects, **applies migrations automatically**, and starts indexing:
 
 ```bash
-# Start Postgres
-docker run -d --name strait-pg \
-  -e POSTGRES_PASSWORD=password \
-  -e POSTGRES_DB=strait \
-  -p 5432:5432 postgres:16
-
-# Run migrations and start
-sqlx migrate run
-cargo run --release -p strait-node
+cargo run -p strait-node        # add --release for production
+# → API + GraphQL on http://localhost:8080 ,  GraphiQL at http://localhost:8080/graphql
 ```
 
-Shutdown cleanly with `Ctrl+C` — all tasks drain before exiting.
+`Ctrl+C` shuts down cleanly (tasks drain before exiting). A failing chain (e.g. a bad RPC)
+is logged but does **not** take the node down — the API and healthy chains keep running.
+
+**Backfill history** by pointing the start block at known activity (the ingester resumes
+forward from there and persists checkpoints): set `HEMI_START_BLOCK` / `ETH_START_BLOCK`.
+
+### Dashboard
+
+A Next.js tunnel explorer lives in [`frontend/`](frontend) and reads the GraphQL API:
+
+```bash
+cd frontend
+STRAIT_API_URL=http://localhost:8080/graphql npm install && npm run dev
+# → http://localhost:3000/dashboard
+```
+
+The overview lists recent transfers with a live status funnel; each transfer has a
+**finality-lifecycle** page (source deposit → Hemi mint → PoP keystone → finalized) with
+outbound links to mempool.space / the Hemi explorer. No data yet? Seed a few demo rows:
+
+```bash
+DATABASE_URL='…' cargo run -p strait-store --example seed
+```
 
 ### Mainnet addresses
 
@@ -619,19 +520,20 @@ Reorgs are treated as normal control flow, not edge cases:
 ### Run tests
 
 ```bash
-# Unit tests (no external dependencies)
-cargo test -p strait-core
-cargo test -p strait-join
-cargo test -p strait-bitcoin   # includes OP_RETURN parsing tests
+# Full suite — DB-backed tests are #[ignore]d and skipped without a database,
+# so this needs no external services.
+cargo test --workspace
 
-# Integration tests (require a running Postgres)
-DATABASE_URL=postgres://... cargo test -p strait-store
+# Opt into the live DB/GraphQL tests against a real Postgres/Supabase:
+DATABASE_URL=postgres://... cargo test --workspace -- --ignored
 ```
 
 ### Structured logging
 
+The default is clean (`info,sqlx=warn`). Opt into per-block / per-poll detail with `RUST_LOG`:
+
 ```bash
-RUST_LOG=strait=debug,sqlx=warn cargo run -p strait-node
+RUST_LOG=strait_evm=debug cargo run -p strait-node   # verbose ingester tracing
 ```
 
 Key log lines to watch when verifying the indexer is working:
@@ -647,10 +549,12 @@ INFO strait_join::engine: Transfer INITIATED → ANCHORED transfer_id=550e8400-.
 
 ### Database migrations
 
+Migrations in [`crates/strait-store/migrations/`](crates/strait-store/migrations) are
+**applied automatically** when `strait-node` starts — there's nothing to run by hand. To
+author a new one you can use [`sqlx-cli`](https://github.com/launchbadge/sqlx/tree/main/sqlx-cli):
+
 ```bash
-sqlx migrate run       # apply pending
-sqlx migrate revert    # revert last
-sqlx migrate add <name>
+sqlx migrate add <name>   # scaffold a new migration (then edit the .sql)
 ```
 
 ---
@@ -674,9 +578,15 @@ MIT — see [LICENSE](LICENSE) for details.
 
 ---
 
-## Related Documents
+## Documentation
 
-- [`docs/contract-addresses.md`](docs/contract-addresses.md) — all confirmed contract addresses and hBK interface reference
-- [`files (3)/01-strait-tunnel-indexer.md`](files%20(3)/01-strait-tunnel-indexer.md) — product specification and rationale
-- [`files (3)/02-strait-platform.md`](files%20(3)/02-strait-platform.md) — long-term platform vision
-- [`files (3)/03-strait-wedge-to-platform-strategy.md`](files%20(3)/03-strait-wedge-to-platform-strategy.md) — sequencing strategy
+In-depth developer guides live in [`docs/`](docs):
+
+- [`docs/README.md`](docs/README.md) — documentation index
+- [`docs/tunnel-architecture.md`](docs/tunnel-architecture.md) — how the three-chain tunnel system works end-to-end (start here)
+- [`docs/contract-addresses.md`](docs/contract-addresses.md) — all confirmed contract addresses + BitcoinKit interface
+- [`docs/btc-tunnel-guide.md`](docs/btc-tunnel-guide.md) — Bitcoin tunnel: vaults, OP_RETURN, deposit/withdrawal flows
+- [`docs/eth-tunnel-guide.md`](docs/eth-tunnel-guide.md) — ETH/ERC-20 tunnel via L2StandardBridge
+- [`docs/bitcoinkit-reference.md`](docs/bitcoinkit-reference.md) — reading Bitcoin state from Hemi via the BitcoinKit precompile
+- [`docs/pop-anchoring.md`](docs/pop-anchoring.md) — PoP anchoring and Bitcoin finality
+- [`docs/supabase-setup.md`](docs/supabase-setup.md) — hosting the database on Supabase

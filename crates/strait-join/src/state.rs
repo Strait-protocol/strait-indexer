@@ -10,10 +10,7 @@ use uuid::Uuid;
 
 use strait_core::{
     error::StraitError,
-    events::ChainEvent,
-    types::{
-        BlockRef, Chain, ChainTxHash, TunnelDirection, TunnelRoute, TunnelStatus, TunnelTransfer,
-    },
+    types::{BlockRef, Chain, ChainTxHash, TunnelStatus, TunnelTransfer},
 };
 
 /// Tracks in-flight transfers and the latest chain tip for each chain.
@@ -268,7 +265,8 @@ impl Default for TransferState {
 mod tests {
     use super::*;
     use strait_core::types::{
-        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TxHash,
+        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TunnelDirection,
+        TunnelRoute, TxHash,
     };
     use chrono::Utc;
 
@@ -279,6 +277,9 @@ mod tests {
             direction: TunnelDirection::In,
             route: TunnelRoute::BtcToHemi,
             amount: bigdecimal::BigDecimal::from(100_000),
+            source_fee: None,
+            dest_fee: None,
+            withdrawal_uuid: None,
             sender: strait_core::types::ChainAddress::Bitcoin(
                 strait_core::types::BitcoinAddress::new("bc1qtest"),
             ),

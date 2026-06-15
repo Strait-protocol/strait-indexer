@@ -9,19 +9,21 @@ use std::time::Duration;
 use alloy::primitives::{Address as AlloyAddress, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use std::collections::BTreeMap;
 use tracing::{debug, error, info, instrument, warn};
 
 use strait_core::{
     config::EvmChainConfig,
     error::{Result, StraitError},
-    events::{RawEvent, HemiEvent},
-    types::{Address, Asset, BitcoinTxid, ChainAddress, BitcoinAddress, TxHash},
+    events::{RawEvent, HemiEvent, EthereumEvent},
+    types::{Address, Asset, BitcoinTxid, Chain, ChainAddress, BitcoinAddress, TxHash},
 };
+use strait_store::{CheckpointRepo, Database, TunnelTransferRepo, UpsertCheckpoint};
 
 use crate::contracts::{IBitcoinTunnelManager, IPoPPayoutsV2, IStandardBridge, topics};
 use crate::reorg::ReorgDetector;
@@ -29,25 +31,33 @@ use crate::reorg::ReorgDetector;
 /// EVM chain ingester that watches for tunnel contract events.
 pub struct EvmIngester {
     config: EvmChainConfig,
+    /// Which chain this ingester serves — used as the checkpoint key.
+    chain: Chain,
     provider: Arc<dyn Provider>,
     reorg_detector: ReorgDetector,
     event_tx: mpsc::Sender<RawEvent>,
+    /// Store handle for reading/writing the ingestion checkpoint.
+    db: Database,
 }
 
 impl EvmIngester {
-    /// Create a new EVM ingester.
+    /// Create a new EVM ingester for `chain`.
     pub fn new(
         config: EvmChainConfig,
+        chain: Chain,
         provider: Arc<dyn Provider>,
+        db: Database,
         event_tx: mpsc::Sender<RawEvent>,
     ) -> Self {
         let reorg_detector = ReorgDetector::new(config.confirmation_depth as u64);
-        
+
         Self {
             config,
+            chain,
             provider,
             reorg_detector,
             event_tx,
+            db,
         }
     }
 
@@ -55,34 +65,86 @@ impl EvmIngester {
     #[instrument(skip(self), fields(chain = %self.config.chain_id))]
     pub async fn run(self) -> Result<()> {
         info!("Starting EVM ingester for chain {}", self.config.chain_id);
-        
+
         let mut last_block = self.get_start_block().await?;
         info!("Starting from block {}", last_block);
-        
+
+        // Exponential backoff state for rate-limit (429) errors.
+        // On first 429: wait 10s. Each subsequent: double, capped at 5 minutes.
+        // Resets to 0 on any successful poll.
+        let mut rate_limit_backoff_secs: u64 = 0;
+
         loop {
             match self.process_new_blocks(&last_block).await {
                 Ok(new_last) => {
                     last_block = new_last;
+                    rate_limit_backoff_secs = 0;
+                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
                 }
                 Err(e) => {
-                    error!("Error processing blocks: {}", e);
-                    sleep(Duration::from_secs(5)).await;
+                    if is_rate_limit_error(&e) {
+                        rate_limit_backoff_secs = if rate_limit_backoff_secs == 0 {
+                            10
+                        } else {
+                            (rate_limit_backoff_secs * 2).min(300)
+                        };
+                        warn!(
+                            backoff_secs = rate_limit_backoff_secs,
+                            "Rate limit (429) — backing off before retry"
+                        );
+                        sleep(Duration::from_secs(rate_limit_backoff_secs)).await;
+                    } else {
+                        error!("Error processing blocks: {}", e);
+                        sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
-            
-            sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
         }
     }
 
-    /// Get the starting block height.
+    /// Determine the block to resume from (returns the last *processed* block;
+    /// the run loop continues at the next block).
+    ///
+    /// Priority: persisted checkpoint → configured `start_block` (backfill) →
+    /// near the chain tip.
     async fn get_start_block(&self) -> Result<u64> {
+        // 1. Resume from a persisted checkpoint if one exists.
+        let repo = CheckpointRepo::new(&self.db);
+        if let Some(cp) = repo.get(self.chain).await? {
+            if cp.block_height > 0 {
+                info!(
+                    chain = %self.chain,
+                    block = cp.block_height,
+                    "Resuming from persisted checkpoint"
+                );
+                return Ok(cp.block_height as u64);
+            }
+        }
+
+        // 2. Backfill from a configured start block (process start_block onward).
+        if self.config.start_block > 0 {
+            info!(chain = %self.chain, block = self.config.start_block, "Starting backfill from configured start_block");
+            return Ok(self.config.start_block.saturating_sub(1));
+        }
+
+        // 3. Otherwise start near the chain tip.
         let latest = self.provider
             .get_block_number()
             .await
             .map_err(|e| StraitError::EvmProvider(format!("Failed to get block number: {}", e)))?;
-        
-        // Start from confirmation_depth blocks ago
         Ok(latest.saturating_sub(self.config.confirmation_depth as u64))
+    }
+
+    /// Persist the ingestion checkpoint for this chain.
+    async fn save_checkpoint(&self, block_num: u64, block_hash: B256) -> Result<()> {
+        let repo = CheckpointRepo::new(&self.db);
+        repo.upsert(UpsertCheckpoint {
+            chain: self.chain,
+            block_height: block_num as i64,
+            block_hash: block_hash.to_string(),
+        })
+        .await?;
+        Ok(())
     }
 
     /// Process new blocks and emit events.
@@ -106,52 +168,107 @@ impl EvmIngester {
             return Err(StraitError::Chain(format!("Reorg detected at block {}", *last_block)));
         }
         
-        // Process blocks one at a time
+        // Scan in windows: one get_logs call covers up to LOG_RANGE blocks, and we only
+        // fetch block headers for the (few) blocks that actually carry tunnel events.
+        // This keeps RPC usage far below per-block scanning — important on rate-limited
+        // public endpoints — and we checkpoint once per window (re-processing a window
+        // after a crash is harmless, as all writes are idempotent upserts).
+        const LOG_RANGE: u64 = 100;
         let mut new_last = *last_block;
-        for block_num in (*last_block + 1)..=confirmed {
-            self.process_block(block_num).await?;
-            new_last = block_num;
+        while new_last < confirmed {
+            let from = new_last + 1;
+            let to = (from + LOG_RANGE - 1).min(confirmed);
+            let to_hash = self.process_block_range(from, to).await?;
+            self.save_checkpoint(to, to_hash).await?;
+            new_last = to;
         }
-        
+
+        // Heartbeat so a caught-up node is visibly alive (range scanning is otherwise
+        // silent for blocks with no tunnel events).
+        info!("indexed up to block {} (chain tip {})", new_last, latest);
         Ok(new_last)
     }
 
-    /// Process a single block for tunnel events.
-    #[instrument(skip(self), fields(block = block_num))]
-    async fn process_block(&self, block_num: u64) -> Result<()> {
-        debug!("Processing block {}", block_num);
-        
-        // Get block with timestamp
+    /// Scan a window of blocks `[from, to]` with a single get_logs call, process any
+    /// tunnel events in chain order, and return the hash of block `to` (for the checkpoint).
+    #[instrument(skip(self), fields(from = from, to = to))]
+    async fn process_block_range(&self, from: u64, to: u64) -> Result<B256> {
+        let mut logs = self.get_tunnel_logs(from, to).await?;
+        // get_logs returns in chain order, but sort defensively before processing.
+        logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
+        if !logs.is_empty() {
+            info!("found {} tunnel event(s) in blocks {}-{}", logs.len(), from, to);
+        }
+
+        // Fetch each relevant block's header once (timestamp + hash). Most blocks in the
+        // window carry no tunnel events, so this is a handful of calls, not one per block.
+        let mut headers: BTreeMap<u64, (B256, DateTime<Utc>)> = BTreeMap::new();
+        for log in &logs {
+            let bn = log.block_number.unwrap_or(0);
+            if let std::collections::btree_map::Entry::Vacant(e) = headers.entry(bn) {
+                e.insert(self.fetch_block_header(bn).await?);
+            }
+        }
+
+        for log in logs {
+            let bn = log.block_number.unwrap_or(0);
+            let (block_hash, block_time) =
+                headers.get(&bn).copied().unwrap_or((B256::ZERO, Utc::now()));
+            self.process_log(log, bn, block_hash, block_time).await?;
+        }
+
+        // The checkpoint needs the hash of `to`; reuse it if it carried events, else fetch.
+        match headers.get(&to) {
+            Some((hash, _)) => Ok(*hash),
+            None => Ok(self.fetch_block_header(to).await?.0),
+        }
+    }
+
+    /// Fetch a single block's hash and timestamp.
+    async fn fetch_block_header(&self, block_num: u64) -> Result<(B256, DateTime<Utc>)> {
         let block = self.provider
             .get_block_by_number(block_num.into(), false)
             .await
             .map_err(|e| StraitError::EvmProvider(format!("Failed to get block: {}", e)))?
             .ok_or_else(|| StraitError::EvmProvider(format!("Block {} not found", block_num)))?;
-        
-        let block_hash = block.header.hash;
-        let block_time = DateTime::from_timestamp(block.header.timestamp as i64, 0)
+        let hash = block.header.hash;
+        let time = DateTime::from_timestamp(block.header.timestamp as i64, 0)
             .unwrap_or_else(Utc::now);
-        
-        // Get logs for tunnel contract
-        let logs = self.get_tunnel_logs(block_num).await?;
-        
-        for log in logs {
-            self.process_log(log, block_num, block_hash, block_time).await?;
-        }
-        
-        Ok(())
+        Ok((hash, time))
     }
 
-    /// Get logs from the tunnel contract for a specific block.
-    async fn get_tunnel_logs(&self, block_num: u64) -> Result<Vec<Log>> {
-        // Parse the tunnel contract address from hex string
-        let tunnel_address: AlloyAddress = self.config.tunnel_contract.parse()
-            .map_err(|e| StraitError::Parse(format!("Invalid tunnel contract address: {}", e)))?;
-        
+    /// Fetch the gas fee spent on a transaction (wei = gasUsed * effectiveGasPrice).
+    /// Best-effort — returns None if the receipt can't be fetched.
+    async fn fetch_gas_fee(&self, tx_hash: B256) -> Option<bigdecimal::BigDecimal> {
+        let receipt = self.provider.get_transaction_receipt(tx_hash).await.ok()??;
+        let fee = U256::from(receipt.gas_used)
+            .checked_mul(U256::from(receipt.effective_gas_price))?;
+        u256_to_bigdecimal(fee).ok()
+    }
+
+    /// Get tunnel-contract logs across a window of blocks `[from_block, to_block]`.
+    async fn get_tunnel_logs(&self, from_block: u64, to_block: u64) -> Result<Vec<Log>> {
+        // Watch the ETH/ERC-20 tunnel (L2StandardBridge / L1 bridge) and, on Hemi,
+        // the BTC tunnel (BitcoinTunnelManager) — DepositConfirmed / WithdrawalInitiated
+        // for BTC routes are emitted there, not on the standard bridge.
+        let mut addresses: Vec<AlloyAddress> = Vec::with_capacity(2);
+        addresses.push(
+            self.config.tunnel_contract.parse().map_err(|e| {
+                StraitError::Parse(format!("Invalid tunnel contract address: {}", e))
+            })?,
+        );
+        if let Some(btc) = self.config.btc_tunnel_contract.as_deref() {
+            if !btc.is_empty() {
+                addresses.push(btc.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid BTC tunnel contract address: {}", e))
+                })?);
+            }
+        }
+
         let filter = alloy::rpc::types::Filter::new()
-            .address(tunnel_address)
-            .from_block(block_num)
-            .to_block(block_num);
+            .address(addresses)
+            .from_block(from_block)
+            .to_block(to_block);
         
         let logs = self.provider
             .get_logs(&filter)
@@ -170,7 +287,7 @@ impl EvmIngester {
         log: Log,
         block_num: u64,
         _block_hash: B256,
-        _block_time: DateTime<Utc>,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         let tx_hash = log.transaction_hash
             .ok_or_else(|| StraitError::Parse("Missing transaction hash".into()))?;
@@ -199,7 +316,7 @@ impl EvmIngester {
                 if let Ok(decoded) = IStandardBridge::ETHBridgeFinalized::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_eth_deposit(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                    self.handle_eth_deposit(from, to, decoded.amount, tx_hash, block_num, log_index, block_time).await?;
                 }
             }
         } else if topic0 == topics::eth_bridge_initiated() {
@@ -210,7 +327,7 @@ impl EvmIngester {
                 if let Ok(decoded) = IStandardBridge::ETHBridgeInitiated::decode_raw_log(
                     log_topics.iter().copied(), data, false,
                 ) {
-                    self.handle_eth_withdrawal(from, to, decoded.amount, tx_hash, block_num, log_index).await?;
+                    self.handle_eth_withdrawal(from, to, decoded.amount, tx_hash, block_num, log_index, block_time).await?;
                 }
             }
         } else if topic0 == topics::erc20_bridge_finalized() {
@@ -228,7 +345,7 @@ impl EvmIngester {
                     let to = Address(decoded.to.into());
                     self.handle_erc20_deposit(
                         local_token, remote_token, from, to,
-                        decoded.amount, tx_hash, block_num, log_index,
+                        decoded.amount, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -247,7 +364,7 @@ impl EvmIngester {
                     let to = Address(decoded.to.into());
                     self.handle_erc20_withdrawal(
                         local_token, remote_token, from, to,
-                        decoded.amount, tx_hash, block_num, log_index,
+                        decoded.amount, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -269,7 +386,7 @@ impl EvmIngester {
                 ) {
                     self.handle_btc_deposit_confirmed(
                         addr_from_topic(vault_t), recipient, deposit_tx_id,
-                        decoded.netSatsAfterFee, tx_hash, block_num, log_index,
+                        decoded.netSatsAfterFee, tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -286,7 +403,7 @@ impl EvmIngester {
                 ) {
                     self.handle_btc_withdrawal_initiated(
                         withdrawer, decoded.netSatsAfterFee, decoded.uuid,
-                        tx_hash, block_num, log_index,
+                        tx_hash, block_num, log_index, block_time,
                     ).await?;
                 }
             }
@@ -332,17 +449,76 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeFinalized (deposit on Hemi)");
-        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Eth,
-            amount: u256_to_bigdecimal(amount)?,
-            to,
-            source_txid: None,
-            block_number: block_num,
-            log_index,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, ETHBridgeFinalized is the withdrawal release — funds returned to the user.
+            // First emit the TunnelRelease event so the in-memory matcher can finalize same-session
+            // withdrawals (where the Hemi burn and the L1 release happen without a node restart).
+            let release = RawEvent::Ethereum(EthereumEvent::TunnelRelease {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd.clone(),
+                to,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee: gas_fee.clone(),
+            });
+
+            // DB-backed fallback: if the Hemi burn happened in a previous node session (common
+            // — the OP Stack challenge period is ~1 day), the in-memory matcher's pending_hemi_burns
+            // map is empty and the TunnelRelease would be silently dropped.  Query the DB directly
+            // so restarts don't permanently strand Hemi→ETH withdrawals at INITIATED.
+            let recipient = format!("0x{}", hex::encode(to.0));
+            let dest_tx_hex = format!("0x{}", hex::encode(tx_hash.0));
+            let repo = TunnelTransferRepo::new(&self.db);
+            match repo.find_pending_eth_withdrawal(&recipient, &amount_bd).await {
+                Ok(Some(transfer)) => {
+                    match repo
+                        .set_eth_withdrawal_finalized(
+                            transfer.id,
+                            &dest_tx_hex,
+                            Some(block_num as i64),
+                            gas_fee,
+                            block_time,
+                        )
+                        .await
+                    {
+                        Ok(()) => info!(
+                            transfer_id = %transfer.id,
+                            dest_tx = %dest_tx_hex,
+                            block = block_num,
+                            "Hemi→ETH withdrawal FINALIZED via DB-backed L1 release match"
+                        ),
+                        Err(e) => warn!(error = %e, "DB finalization write failed for ETH withdrawal"),
+                    }
+                }
+                Ok(None) => {
+                    // No pending INITIATED transfer found — either it was already finalized
+                    // by the in-memory matcher this session, or this is an unknown release.
+                    debug!(recipient = %recipient, amount = %amount_bd, "No pending HEMI_TO_ETH transfer found for L1 release");
+                }
+                Err(e) => warn!(error = %e, "DB lookup failed for pending ETH withdrawal"),
+            }
+
+            release
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelMint {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                to,
+                source_txid: None,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -355,17 +531,37 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(from = %hex::encode(from.0), to = %hex::encode(to.0), %amount, "ETHBridgeInitiated (withdrawal from Hemi)");
-        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Eth,
-            amount: u256_to_bigdecimal(amount)?,
-            from,
-            destination: ChainAddress::Evm(to),
-            block_number: block_num,
-            log_index,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, an "initiated" bridge event is a deposit being locked for L2.
+            RawEvent::Ethereum(EthereumEvent::TunnelLock {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                from,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelBurn {
+                tx_hash: TxHash(tx_hash.0),
+                asset: Asset::Eth,
+                amount: amount_bd,
+                from,
+                destination: ChainAddress::Evm(to),
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+                uuid: None,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -380,6 +576,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             token = %hex::encode(local_token.0),
@@ -388,19 +585,34 @@ impl EvmIngester {
             %amount,
             "ERC20BridgeFinalized (deposit on Hemi)"
         );
-        let event = RawEvent::Hemi(HemiEvent::TunnelMint {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Erc20 {
-                contract: local_token,
-                symbol: String::new(),  // resolved off the token-list if needed
-                decimals: 18,
-            },
-            amount: u256_to_bigdecimal(amount)?,
-            to,
-            source_txid: None,
-            block_number: block_num,
-            log_index,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, a "finalized" bridge event is a withdrawal released to the user.
+            RawEvent::Ethereum(EthereumEvent::TunnelRelease {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                to,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelMint {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                to,
+                source_txid: None,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -415,6 +627,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             token = %hex::encode(local_token.0),
@@ -423,19 +636,35 @@ impl EvmIngester {
             %amount,
             "ERC20BridgeInitiated (withdrawal from Hemi)"
         );
-        let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
-            tx_hash: TxHash(tx_hash.0),
-            asset: Asset::Erc20 {
-                contract: local_token,
-                symbol: String::new(),
-                decimals: 18,
-            },
-            amount: u256_to_bigdecimal(amount)?,
-            from,
-            destination: ChainAddress::Evm(to),
-            block_number: block_num,
-            log_index,
-        });
+        let gas_fee = self.fetch_gas_fee(tx_hash).await;
+        let amount_bd = u256_to_bigdecimal(amount)?;
+        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let event = if self.chain == Chain::Ethereum {
+            // On L1, an "initiated" bridge event is a deposit being locked for L2.
+            RawEvent::Ethereum(EthereumEvent::TunnelLock {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                from,
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+            })
+        } else {
+            RawEvent::Hemi(HemiEvent::TunnelBurn {
+                tx_hash: TxHash(tx_hash.0),
+                asset,
+                amount: amount_bd,
+                from,
+                destination: ChainAddress::Evm(to),
+                block_number: block_num,
+                block_time,
+                log_index,
+                gas_fee,
+                uuid: None,
+            })
+        };
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
@@ -481,6 +710,7 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
         info!(
             recipient = %hex::encode(recipient.0),
@@ -495,7 +725,9 @@ impl EvmIngester {
             to: recipient,
             source_txid: Some(BitcoinTxid(deposit_tx_id)),
             block_number: block_num,
+            block_time,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
@@ -515,11 +747,22 @@ impl EvmIngester {
         tx_hash: B256,
         block_num: u64,
         log_index: u32,
+        block_time: DateTime<Utc>,
     ) -> Result<()> {
+        // The btcAddress is `indexed` in the event (only a keccak hash survives in the
+        // topic), but the originating initiateWithdrawal(uint32,string,uint256) call
+        // carries it in cleartext — recover it from the transaction calldata so the
+        // transfer has the real Bitcoin recipient (and the Bitcoin payout can be matched).
+        let destination = match self.recover_withdrawal_btc_address(tx_hash).await {
+            Some(addr) => ChainAddress::Bitcoin(BitcoinAddress::new(addr)),
+            None => ChainAddress::Bitcoin(BitcoinAddress::new(format!("withdrawal-uuid-{uuid}"))),
+        };
+
         info!(
             withdrawer = %hex::encode(withdrawer.0),
             %net_sats,
             uuid,
+            recipient = ?destination,
             "WithdrawalInitiated — hBTC burned, BTC payout registered"
         );
         let event = RawEvent::Hemi(HemiEvent::TunnelBurn {
@@ -527,15 +770,34 @@ impl EvmIngester {
             asset: Asset::Btc,
             amount: u256_to_bigdecimal(net_sats)?,
             from: withdrawer,
-            // btcAddress is not recoverable from an indexed string topic.
-            // The bitcoin address will be resolved by watching the payout tx on Bitcoin.
-            destination: ChainAddress::Bitcoin(BitcoinAddress::new(format!("withdrawal-uuid-{uuid}"))),
+            destination,
             block_number: block_num,
+            block_time,
             log_index,
+            gas_fee: self.fetch_gas_fee(tx_hash).await,
+            uuid: Some(uuid),
         });
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))
     }
+
+    /// Recover the plaintext BTC withdrawal address from the originating
+    /// `initiateWithdrawal` transaction's calldata. Returns `None` if the tx can't
+    /// be fetched or its calldata isn't a recognised `initiateWithdrawal` call.
+    async fn recover_withdrawal_btc_address(&self, tx_hash: B256) -> Option<String> {
+        let tx = self.provider.get_transaction_by_hash(tx_hash).await.ok()??;
+        let decoded =
+            IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(tx.input.as_ref(), false)
+                .ok()?;
+        Some(decoded.btcAddress)
+    }
+}
+
+/// Returns true if the error is an HTTP 429 / rate-limit response from the RPC.
+/// Used to distinguish rate limiting from real failures so we can back off properly.
+fn is_rate_limit_error(e: &StraitError) -> bool {
+    let s = e.to_string();
+    s.contains("429") || s.contains("rate limit") || s.contains("rate_limit") || s.contains("-32005")
 }
 
 /// Extract an EVM address from a 32-byte log topic (right-padded to 32 bytes).

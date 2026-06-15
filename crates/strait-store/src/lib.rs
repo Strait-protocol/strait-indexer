@@ -4,12 +4,14 @@
 
 pub mod db;
 pub mod transfers;
+pub mod tunnel_transfers;
 pub mod checkpoints;
 pub mod events;
 pub mod pop_proofs;
 
 pub use db::Database;
 pub use transfers::{Transfer, TransferRepo, CreateTransfer};
+pub use tunnel_transfers::{status_str, TunnelTransferRepo, TunnelTransferRow};
 pub use checkpoints::{Checkpoint, CheckpointRepo, UpsertCheckpoint};
 pub use events::{IndexedEvent, EventRepo, CreateEvent};
 pub use pop_proofs::{PopProof, PopProofRepo, PopProofStatus, CreatePopProof};

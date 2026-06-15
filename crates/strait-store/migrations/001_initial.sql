@@ -94,11 +94,12 @@ CREATE TABLE events (
     event_type      VARCHAR(100) NOT NULL,
     event_data      JSONB NOT NULL DEFAULT '{}',
     processed       BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
-    -- Deduplication constraint
-    CONSTRAINT events_unique UNIQUE (chain, tx_hash, COALESCE(log_index, -1))
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Deduplication: a UNIQUE *table constraint* cannot contain an expression like
+-- COALESCE(), so enforce it with a unique expression index instead.
+CREATE UNIQUE INDEX events_unique ON events (chain, tx_hash, COALESCE(log_index, -1));
 
 -- Indexes
 CREATE INDEX idx_events_chain_block ON events(chain, block_height);

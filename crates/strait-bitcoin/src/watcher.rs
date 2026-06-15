@@ -32,7 +32,7 @@ use strait_core::{
     types::{Address, BitcoinAddress, BitcoinTxid},
 };
 
-use crate::contracts::{IBitcoinKitV1, SpentDetail, UTXO, Output, addresses};
+use crate::contracts::{IBitcoinKitV1, UTXO, addresses};
 
 // ============================================================================
 // BitcoinKit caller
@@ -54,6 +54,20 @@ impl BitcoinKitCaller {
     /// Create a caller for Hemi Sepolia (BitcoinKit v0).
     pub fn testnet(provider: Arc<dyn Provider>) -> Self {
         Self { provider, contract: addresses::HEMI_SEPOLIA_BITCOIN_KIT_V0 }
+    }
+
+    /// Create a caller for an explicitly-configured BitcoinKit address.
+    pub fn new(provider: Arc<dyn Provider>, contract: alloy::primitives::Address) -> Self {
+        Self { provider, contract }
+    }
+
+    /// Current Bitcoin tip height as seen by Hemi (via `getLastHeader`).
+    pub async fn get_tip_height(&self) -> Result<u32> {
+        let call = IBitcoinKitV1::getLastHeaderCall {};
+        let result = self.call(call.abi_encode()).await?;
+        let decoded = IBitcoinKitV1::getLastHeaderCall::abi_decode_returns(&result, false)
+            .map_err(|e| StraitError::Parse(format!("getLastHeader decode: {e}")))?;
+        Ok(decoded._0.height)
     }
 
     /// Check whether a Bitcoin txid exists in the chain as seen by Hemi.
@@ -131,6 +145,25 @@ impl BitcoinKitCaller {
             }
         }
         Ok(None)
+    }
+
+    /// Bitcoin transaction fee in sats = Σ input values − Σ output values.
+    ///
+    /// Best-effort: returns `None` unless BitcoinKit reports a *complete* set of
+    /// inputs and outputs (an incomplete set would understate the fee).
+    pub async fn get_tx_fee_sats(&self, txid: &BitcoinTxid) -> Result<Option<u64>> {
+        let call = IBitcoinKitV1::getTransactionByTxIdCall { txId: B256::from(txid.0) };
+        let result = self.call(call.abi_encode()).await?;
+        let tx = IBitcoinKitV1::getTransactionByTxIdCall::abi_decode_returns(&result, false)
+            .map_err(|e| StraitError::Parse(format!("getTransactionByTxId decode: {e}")))?
+            ._0;
+
+        if !tx.containsAllInputs || !tx.containsAllOutputs {
+            return Ok(None);
+        }
+        let total_in: u128 = tx.inputs.iter().map(|i| i.inValue.saturating_to::<u128>()).sum();
+        let total_out: u128 = tx.outputs.iter().map(|o| o.outValue.saturating_to::<u128>()).sum();
+        Ok(total_in.checked_sub(total_out).map(|f| f as u64))
     }
 
     /// Execute a raw eth_call against the BitcoinKit precompile.
@@ -229,8 +262,19 @@ impl CustodyWatcher {
     pub async fn poll_new_deposits(&mut self) -> Result<Vec<DepositCandidate>> {
         let mut candidates = Vec::new();
 
+        // Bitcoin tip height (best-effort) so we can derive each deposit's block.
+        let tip_height = self.caller.get_tip_height().await.unwrap_or(0);
+
         for addr in &self.addresses.clone() {
-            let utxos = self.caller.get_utxos_for_address(addr).await?;
+            // One bad/invalid custody address must not fail the whole poll —
+            // log it and move on to the others.
+            let utxos = match self.caller.get_utxos_for_address(addr).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(address = %addr, error = %e, "Failed to read UTXOs for custody address — skipping");
+                    continue;
+                }
+            };
             debug!(address = %addr, count = utxos.len(), "Polled UTXOs");
 
             for utxo in utxos {
@@ -257,10 +301,18 @@ impl CustodyWatcher {
 
                 let confirmations = self.caller.get_confirmations(&bitcoin_txid).await?;
 
+                // Block height of the deposit tx ≈ tip - (confirmations - 1).
+                let block_height = if confirmations > 0 {
+                    (tip_height as u64).saturating_sub(confirmations as u64 - 1)
+                } else {
+                    0
+                };
+
                 info!(
                     txid = %hex::encode(txid),
                     amount_sats = %utxo.value,
                     confirmations,
+                    block_height,
                     "New tunnel deposit candidate"
                 );
 
@@ -270,6 +322,7 @@ impl CustodyWatcher {
                     amount_sats: utxo.value.saturating_to::<u64>(),
                     to_address: BitcoinAddress::new(addr.clone()),
                     hemi_destination: hemi_destination.unwrap(),
+                    block_height,
                     confirmations,
                 });
 
@@ -290,6 +343,8 @@ pub struct DepositCandidate {
     pub amount_sats: u64,
     pub to_address: BitcoinAddress,
     pub hemi_destination: Address,
+    /// Bitcoin block height the deposit was mined in (0 if unconfirmed/unknown).
+    pub block_height: u64,
     pub confirmations: u32,
 }
 

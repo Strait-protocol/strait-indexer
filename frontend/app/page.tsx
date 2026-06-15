@@ -9,7 +9,7 @@ export default function Home() {
       <WhyBetter />
       <Features />
       <EcosystemImpact />
-      <HowToUse />
+      <BuiltOnStrait />
       <Roadmap />
       <CTA />
       <Footer />
@@ -31,7 +31,8 @@ function Nav() {
         <div className="hidden md:flex items-center gap-8 text-sm text-zinc-400">
           <a href="#how-it-works" className="hover:text-white transition-colors">How It Works</a>
           <a href="#why-better" className="hover:text-white transition-colors">Why Strait</a>
-          <a href="#how-to-use" className="hover:text-white transition-colors">Docs</a>
+          <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
+          <a href="/docs" className="hover:text-white transition-colors">Docs</a>
           <a href="#roadmap" className="hover:text-white transition-colors">Roadmap</a>
         </div>
         <div className="flex items-center gap-3">
@@ -45,7 +46,7 @@ function Nav() {
             GitHub
           </a>
           <a
-            href="#how-to-use"
+            href="/docs"
             className="text-sm bg-orange-500 hover:bg-orange-400 text-black font-semibold px-4 py-2 rounded-full transition-colors"
           >
             Get API Access
@@ -84,7 +85,7 @@ function Hero() {
 
         <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
           <a
-            href="#how-to-use"
+            href="/docs"
             className="w-full sm:w-auto px-8 py-3.5 bg-orange-500 hover:bg-orange-400 text-black font-semibold rounded-full transition-colors text-sm"
           >
             Start querying →
@@ -638,159 +639,61 @@ function EcosystemImpact() {
 
 /* ─── How to Use ──────────────────────────────────────────────────────────── */
 
-function HowToUse() {
+function BuiltOnStrait() {
+  const apps = [
+    {
+      name: 'Strait APIs',
+      status: 'Live',
+      desc: 'The GraphQL and REST API that powers everything here — full Transfer schema, queries, contract addresses, and a self-host guide.',
+      cta: 'Read the docs',
+    },
+    {
+      name: 'Strait Analytics',
+      status: 'In progress',
+      desc: 'Volume, TVL, route utilization, average finality time, and flow charts — Dune-style dashboards built straight off the indexed tunnel data.',
+      cta: 'Build with the API',
+    },
+    {
+      name: 'Strait BTC-Collateralized Cross-Chain Lending',
+      status: 'Idea',
+      desc: 'Use Bitcoin-anchored tunnel transfers as a settlement and collateral signal — lend against BTC bridged into Hemi, settled across chains.',
+      cta: 'Explore the idea',
+    },
+  ];
+  const badge = (s: string) => {
+    const cls =
+      s === 'Live'
+        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+        : s === 'In progress'
+          ? 'border-orange-500/30 bg-orange-500/10 text-orange-300'
+          : 'border-white/10 bg-white/[0.04] text-zinc-400';
+    return (
+      <span className={`text-[11px] font-mono rounded-full border px-2 py-0.5 ${cls}`}>{s}</span>
+    );
+  };
   return (
     <section className="py-28 px-6 bg-white/[0.015]" id="how-to-use">
-      <div className="max-w-5xl mx-auto">
+      <div className="max-w-6xl mx-auto">
         <div className="text-center mb-16">
-          <div className="text-xs font-mono text-orange-400 uppercase tracking-widest mb-4">Quick start</div>
-          <h2 className="text-4xl md:text-5xl font-bold tracking-tight mb-6">
-            Start in minutes
-          </h2>
+          <div className="text-xs font-mono text-orange-400 uppercase tracking-widest mb-4">Built on Strait</div>
+          <h2 className="text-4xl md:text-5xl font-bold tracking-tight mb-6">One API, many apps</h2>
+          <p className="text-zinc-400 max-w-2xl mx-auto">
+            Strait is infrastructure. Every app below reads the same indexed tunnel data — start with the developer docs.
+          </p>
         </div>
-
-        <div className="grid md:grid-cols-2 gap-8">
-          <div>
-            <h3 className="text-lg font-semibold text-white mb-4">Query via GraphQL</h3>
-            <CodeBlock language="graphql" code={`query RecentTransfers {
-  tunnelTransfers(
-    filter: {
-      route: BTC_TO_HEMI
-      status: FINALIZED
-      initiatedAfter: "2025-03-12T00:00:00Z"
-    }
-    first: 10
-  ) {
-    edges {
-      node {
-        id
-        amount
-        sender
-        recipient
-        initiatedAt
-        finalizedAt
-        sourceTx { hash blockNumber }
-        destinationTx { hash blockNumber }
-      }
-    }
-  }
-}`} />
-          </div>
-
-          <div>
-            <h3 className="text-lg font-semibold text-white mb-4">Register a webhook</h3>
-            <CodeBlock language="bash" code={`curl -X POST https://api.strait.xyz/webhooks \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "url": "https://your-app.com/hooks/strait",
-    "secret": "your-hmac-secret",
-    "filter": {
-      "routes": ["BTC_TO_HEMI"],
-      "statusTransitions": ["FINALIZED"],
-      "minAmount": "100000000"
-    }
-  }'
-
-# Every delivery includes:
-# X-Strait-Signature: sha256=<hmac>
-# Retry: up to 5x with exponential backoff`} />
-          </div>
-
-          <div>
-            <h3 className="text-lg font-semibold text-white mb-4">Aggregate stats</h3>
-            <CodeBlock language="graphql" code={`query DashboardStats {
-  tunnelStats(window: LAST_7D) {
-    totalVolumeUsd
-    transferCount
-    averageFinalitySecs
-    activeTransfers
-  }
-}`} />
-          </div>
-
-          <div>
-            <h3 className="text-lg font-semibold text-white mb-4">Self-host</h3>
-            <CodeBlock language="bash" code={`git clone https://github.com/strait-data/strait
-cd strait && cp .env.example .env
-
-# Add Bitcoin node, Hemi + Ethereum RPC,
-# and Postgres credentials to .env, then:
-
-createdb strait
-sqlx migrate run
-cargo run --release -p strait-node
-
-# GraphQL:   http://localhost:8080/graphql
-# Playground: http://localhost:8080/`} />
-          </div>
-        </div>
-
-        {/* Pricing */}
-        <div className="mt-16">
-          <h3 className="text-center text-xl font-semibold text-white mb-8">Plans</h3>
-          <div className="grid md:grid-cols-4 gap-4">
-            {[
-              {
-                name: "Free",
-                price: "$0",
-                queries: "100k queries/mo",
-                webhooks: "10k webhooks/mo",
-                cta: "Get started",
-                highlight: false,
-              },
-              {
-                name: "Builder",
-                price: "$99/mo",
-                queries: "5M queries/mo",
-                webhooks: "500k webhooks/mo",
-                cta: "Start building",
-                highlight: false,
-              },
-              {
-                name: "Growth",
-                price: "$499/mo",
-                queries: "50M queries/mo",
-                webhooks: "5M webhooks/mo",
-                cta: "Scale up",
-                highlight: true,
-              },
-              {
-                name: "Enterprise",
-                price: "Custom",
-                queries: "Unlimited",
-                webhooks: "Mirror pipelines",
-                cta: "Talk to us",
-                highlight: false,
-              },
-            ].map((p) => (
-              <div
-                key={p.name}
-                className={`rounded-2xl p-6 border ${
-                  p.highlight
-                    ? "border-orange-500/50 bg-orange-500/10"
-                    : "border-white/[0.07] bg-white/[0.03]"
-                }`}
-              >
-                {p.highlight && (
-                  <div className="text-xs text-orange-400 font-mono mb-2">Most popular</div>
-                )}
-                <div className="font-bold text-white text-lg mb-1">{p.name}</div>
-                <div className="text-2xl font-bold text-orange-400 mb-4">{p.price}</div>
-                <div className="text-sm text-zinc-400 mb-1">{p.queries}</div>
-                <div className="text-sm text-zinc-400 mb-6">{p.webhooks}</div>
-                <a
-                  href="#"
-                  className={`block text-center text-sm font-semibold py-2 rounded-full transition-colors ${
-                    p.highlight
-                      ? "bg-orange-500 hover:bg-orange-400 text-black"
-                      : "border border-white/10 hover:border-white/30 text-zinc-300"
-                  }`}
-                >
-                  {p.cta}
-                </a>
-              </div>
-            ))}
-          </div>
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-5">
+          {apps.map((a) => (
+            <a
+              key={a.name}
+              href="/docs"
+              className="group rounded-2xl border border-white/[0.07] bg-white/[0.03] p-6 flex flex-col hover:border-orange-500/40 transition-colors"
+            >
+              <div className="mb-3">{badge(a.status)}</div>
+              <div className="font-bold text-white text-lg mb-2">{a.name}</div>
+              <p className="text-sm text-zinc-400 leading-relaxed flex-1">{a.desc}</p>
+              <span className="mt-5 text-sm text-orange-400 group-hover:text-orange-300">{a.cta} →</span>
+            </a>
+          ))}
         </div>
       </div>
     </section>
@@ -939,7 +842,7 @@ function CTA() {
           </p>
           <div className="flex flex-col sm:flex-row gap-4 justify-center">
             <a
-              href="#how-to-use"
+              href="/docs"
               className="px-8 py-3.5 bg-orange-500 hover:bg-orange-400 text-black font-semibold rounded-full transition-colors text-sm"
             >
               Get API access →
@@ -971,6 +874,7 @@ function Footer() {
           <span className="text-zinc-600 text-sm">Real-time tunnel indexer for Hemi</span>
         </div>
         <div className="flex items-center gap-6 text-sm text-zinc-500">
+          <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
           <a href="#how-it-works" className="hover:text-white transition-colors">Docs</a>
           <a
             href="https://github.com/strait-data/strait"
@@ -989,24 +893,6 @@ function Footer() {
 }
 
 /* ─── Shared components ───────────────────────────────────────────────────── */
-
-function CodeBlock({ code, language }: { code: string; language: string }) {
-  return (
-    <div className="bg-zinc-900/80 border border-white/[0.08] rounded-xl overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.06]">
-        <span className="text-xs text-zinc-500 font-mono">{language}</span>
-        <div className="flex gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-        </div>
-      </div>
-      <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto leading-relaxed">
-        <code>{code}</code>
-      </pre>
-    </div>
-  );
-}
 
 function GithubIcon() {
   return (

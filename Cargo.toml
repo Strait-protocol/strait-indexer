@@ -28,8 +28,8 @@ alloy = { version = "0.3", features = ["full"] }
 bitcoincore-rpc = "0.18"
 bitcoin = { version = "0.32", features = ["serde"] }
 
-# Database
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "uuid", "bigdecimal", "chrono", "migrate"] }
+# Database — Supabase is Postgres; tls-rustls is required because Supabase mandates SSL
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "bigdecimal", "chrono", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -55,7 +55,7 @@ config = "0.14"
 dotenvy = "0.15"
 
 # Utilities
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
 tokio-stream = "0.1"
