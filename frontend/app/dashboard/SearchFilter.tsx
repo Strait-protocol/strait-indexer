@@ -7,7 +7,7 @@ const STATUSES = ["INITIATED", "ANCHORED", "FINALIZED", "FAILED", "REORGED"];
 const ROUTES = ["BTC_TO_HEMI", "HEMI_TO_BTC", "ETH_TO_HEMI", "HEMI_TO_ETH"];
 
 const field =
-  "rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-zinc-200 focus:border-orange-400/50 focus:outline-none";
+  "rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white focus:border-orange-400/50 focus:outline-none";
 
 /** Search (address / tx hash / id) + status & route filters, driven through the
  *  URL search params so results are server-rendered and shareable. */
@@ -50,17 +50,17 @@ export default function SearchFilter({ network }: { network: string }) {
         />
       </form>
       <select value={status} onChange={(e) => apply({ status: e.target.value })} className={field}>
-        <option value="">All statuses</option>
+        <option className="text-black" value="">All statuses</option>
         {STATUSES.map((s) => (
-          <option key={s} value={s}>
+          <option className="text-black" key={s} value={s}>
             {s}
           </option>
         ))}
       </select>
       <select value={route} onChange={(e) => apply({ route: e.target.value })} className={field}>
-        <option value="">All routes</option>
+        <option className="text-black" value="">All routes</option>
         {ROUTES.map((r) => (
-          <option key={r} value={r}>
+          <option className="text-black" key={r} value={r}>
             {r.replace(/_/g, " → ").replace("BTC", "BTC").replace("ETH", "ETH")}
           </option>
         ))}
@@ -71,7 +71,7 @@ export default function SearchFilter({ network }: { network: string }) {
             setQ("");
             router.push(`/dashboard/${network}`);
           }}
-          className="rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-400 hover:text-white"
+          className="rounded-lg border border-white/10 px-3 py-2 text-sm text-white hover:text-zinc-300"
         >
           Clear
         </button>

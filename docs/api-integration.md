@@ -44,7 +44,7 @@ single tunnel transfer.
 | `amount` | `amount` | String | **Atomic units** (satoshis or wei) as a plain decimal string. See [§5](#5-amounts). |
 | `sender` | `sender` | String | Origin address (EVM `0x…` or a Bitcoin address). |
 | `recipient` | `recipient` | String | Destination address. |
-| `status` | `status` | Enum | `INITIATED` \| `ANCHORED` \| `FINALIZED` \| `FAILED` \| `REORGED`. |
+| `status` | `status` | Enum | `INITIATED` \| `FINALIZED` \| `FAILED` \| `REORGED`. |
 | `sourceChain` | `source_chain` | Enum | `BITCOIN` \| `HEMI` \| `ETHEREUM`. |
 | `sourceTxHash` | `source_tx_hash` | String | Tx hash on the source chain. |
 | `sourceBlock` | `source_block` | Int | Source block height (`0` = source leg not yet observed; see [§6](#6-field-caveats)). |
@@ -64,19 +64,21 @@ single tunnel transfer.
 
 ## 3. The transfer lifecycle
 
-`status` is what you poll for. The progression depends on the route:
+`status` is what you poll for. All routes go directly from `INITIATED` to `FINALIZED`:
 
 ```
 ETH_TO_HEMI  (deposit) :  INITIATED ─────────────► FINALIZED
-BTC_TO_HEMI  (deposit) :  INITIATED ──► ANCHORED ─► FINALIZED
+BTC_TO_HEMI  (deposit) :  INITIATED ─────────────► FINALIZED   (at Hemi mint)
 HEMI_TO_ETH  (withdraw):  INITIATED ─────────────► FINALIZED   (after L1 challenge window)
-HEMI_TO_BTC  (withdraw):  INITIATED ──► ANCHORED ─► FINALIZED
+HEMI_TO_BTC  (withdraw):  INITIATED ─────────────► FINALIZED   (when BTC payout detected)
 ```
 
-- `INITIATED` — the transfer has been seen on its source chain.
-- `ANCHORED` — (BTC routes) committed to Bitcoin via Proof-of-Proof. `popAnchored=true`.
-- `FINALIZED` — complete and irreversible.
-- `FAILED` / `REORGED` — terminal failure / rolled back by a chain reorg.
+- `INITIATED` — the transfer has been seen on its source chain but not yet complete.
+- `FINALIZED` — complete. The recipient has their funds.
+- `FAILED` — terminal failure. For `HEMI_TO_BTC`: the operator did not pay the Bitcoin payout within the deadline and a `WithdrawalChallengeSuccess` event fired on `BitcoinTunnelManager` — the user's hBTC is automatically re-minted to them by the contract. The transfer is terminal; no further action is needed. Users who receive a FAILED `HEMI_TO_BTC` should see their hBTC balance restored on Hemi.
+- `REORGED` — the source-chain transaction was rolled back by a chain reorganization before the transfer completed. The user's funds are safe on the source chain (a reorg undoes the transaction, so the tokens were never spent), but the transfer will not proceed. The user must re-initiate the transfer from scratch. REORGED can occur on any chain — Bitcoin (rare, deep reorgs only), Ethereum, or Hemi — if a block containing the initiating transaction is orphaned.
+
+**PoP anchoring is separate from `FINALIZED`.** For `BTC_TO_HEMI` deposits, the transfer reaches `FINALIZED` as soon as the hBTC mint is confirmed on Hemi — the user has their funds. Bitcoin-grade finality (anchoring to the Bitcoin chain via Hemi's Proof-of-Publication system) is tracked independently by the `popAnchored` / `popKeystoneBlock` fields and does not gate `FINALIZED`. When a PoP keystone covers a deposit's mint block, `popAnchored` flips to `true` while `status` stays `FINALIZED`.
 
 A robust integration treats `FINALIZED` as "done" and anything else as "in flight."
 
@@ -163,12 +165,18 @@ These reflect what is reliably populated **today**:
   mint) tx is real.
 - **BTC recipient on `HEMI_TO_BTC`** is recovered from the withdrawal transaction's
   calldata. If recovery fails it falls back to a `withdrawal-uuid-<n>` placeholder.
-- **`popAnchored` / `ANCHORED` / PoP fields** depend on PoP keystone ingestion. If
-  PoP anchoring isn't wired in your deployment, these stay `false`/`null` and BTC
-  deposits remain `INITIATED` — don't gate UX on `ANCHORED` unless you've confirmed
-  it's live.
-- **Withdrawals** stay `INITIATED` until their destination leg is matched (ETH
-  withdrawals also wait out the ~7-day OP-Stack challenge window).
+- **`popAnchored` / PoP fields** are set when a PoP keystone covers a `BTC_TO_HEMI`
+  deposit's Hemi mint block. PoP anchoring is not required for `FINALIZED` — a deposit
+  reaches `FINALIZED` at mint, and `popAnchored` upgrades to `true` independently when
+  the keystone fires. If PoP is not yet active on the network, `popAnchored` stays
+  `false` but `status` is still `FINALIZED`.
+- **Withdrawals** stay `INITIATED` until their destination leg is matched. ETH
+  withdrawals go through two on-chain steps before `FINALIZED`: someone must call
+  `proveWithdrawalTransaction` on Ethereum (advances to `PROVING` — Strait does not do
+  this automatically, and an un-proven withdrawal waits indefinitely, not just ~1 day),
+  then Hemi's ~1 day challenge window elapses (shortened from the standard OP Stack
+  7 days by anchoring finality to Bitcoin via PoP) before `finalizeWithdrawalTransaction`
+  releases the funds.
 
 ---
 
@@ -177,11 +185,22 @@ These reflect what is reliably populated **today**:
 There is **no subscription/webhook endpoint yet** — poll. Recommended pattern:
 
 ```
-1. Submit a bridge tx; compute/record nothing special — just the recipient address.
-2. Poll transfersByRecipient(recipient) every ~10–15s.
-3. Find your transfer (match on amount + route + recent initiatedAt, or store its id).
-4. Stop when status == FINALIZED (or FAILED / REORGED).
+1. Submit a bridge tx. You already know its tx hash — use it, don't fuzzy-match.
+2. Poll searchTransfers(query: "<your source tx hash>") every ~10–15s.
+3. Stop when status == FINALIZED (or FAILED / REORGED). Cache the returned `id`
+   for any follow-up queries (e.g. transfer(id: ...)) once you have it.
 ```
+
+**Use your known tx hash, not amount + route + time matching.** `searchTransfers` does a
+substring match across `id`, `sender`, `recipient`, and both tx hashes, so
+`searchTransfers(query: "0xabc123...")` finds your transfer directly and unambiguously.
+Matching by amount/route/timestamp instead is fragile — it's the same kind of heuristic
+Strait's own cross-chain event matcher uses internally, and it's exactly the sort of thing
+that breaks when two transfers of the same amount land close together. Don't reimplement
+it client-side when you already have a better key.
+
+If you don't have a tx hash yet (e.g. you only know the user's wallet address), fall back
+to `transfersByRecipient(recipient)` and disambiguate by `initiatedAt` recency.
 
 A new transfer typically appears within seconds of finality on the source chain
 (after the indexer's confirmation buffer), so a 10–15s poll is plenty.

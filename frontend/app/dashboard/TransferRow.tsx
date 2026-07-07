@@ -36,16 +36,10 @@ export default function TransferRow({ t, network }: { t: Transfer; network: Netw
           {s.label}
         </span>
       </td>
-      <td className="px-4 py-3">
-        {t.popAnchored ? (
-          <span className="text-emerald-300">✓ anchored</span>
-        ) : (
-          <span className="text-zinc-600">pending</span>
-        )}
-      </td>
+      <td className="px-4 py-3 font-mono text-zinc-400">{shortHash(t.sender)}</td>
       <td className="px-4 py-3 font-mono text-zinc-400">{shortHash(t.recipient)}</td>
       <td className="px-4 py-3 text-right">
-        <span className="text-zinc-500">{timeAgo(t.initiatedAt)}</span>
+        <span className="text-zinc-500" suppressHydrationWarning>{timeAgo(t.initiatedAt)}</span>
         <span className="ml-2 text-zinc-600 group-hover:text-orange-400">›</span>
       </td>
     </tr>

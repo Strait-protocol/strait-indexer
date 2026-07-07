@@ -34,6 +34,13 @@ interface IStandardBridge {
     event DepositFinalized(address indexed l1Token, address indexed l2Token, address indexed from, address to, uint256 amount, bytes extraData);
     event WithdrawalInitiated(address indexed l1Token, address indexed l2Token, address indexed from, address to, uint256 amount, bytes extraData);
 }
+
+interface IOptimismPortal {
+    // Emitted when proveWithdrawalTransaction is called — starts the ~1 day challenge window.
+    event WithdrawalProven(bytes32 indexed withdrawalHash, address indexed from, address indexed to);
+    // Emitted when finalizeWithdrawalTransaction is called, after the window elapses.
+    event WithdrawalFinalized(bytes32 indexed withdrawalHash, bool success);
+}
 ```
 
 ---
@@ -80,15 +87,51 @@ l2Bridge.on("ETHBridgeFinalized", (from, to, amount, extraData, event) => {
 
 ## Withdrawal flow (Hemi → ETH)
 
+Unlike standard OP Stack chains, this is a **two-step, actively-triggered** process — the
+challenge window does not start ticking until someone calls `proveWithdrawalTransaction`.
+A withdrawal can sit indefinitely at "burned, not yet proven" if nobody submits the proof.
+
 ```
-Hemi                                      Ethereum
-────                                      ────────
-withdraw()                  ~7 day window
-  └─ ETHBridgeInitiated  ──────────────►  ETHBridgeFinalized
-                          (fault proof)     └─ ETH released
+Hemi                          Ethereum (OptimismPortal)             Ethereum (L1StandardBridge)
+────                          ─────────────────────────             ───────────────────────────
+withdraw()
+  └─ ETHBridgeInitiated
+        │
+        │  (anyone can call, once the L2 output
+        │   root covering this block is posted)
+        ▼
+                          proveWithdrawalTransaction(tx, l2OutputIndex,
+                                                      outputRootProof, withdrawalProof)
+                            └─ WithdrawalProven
+                                  │
+                                  │  ~1 day challenge window (Hemi shortens the
+                                  │  standard OP Stack 7-day window by anchoring
+                                  │  finality to Bitcoin via PoP)
+                                  ▼
+                          finalizeWithdrawalTransaction(tx)
+                            └─ WithdrawalFinalized ─────────────►  ETHBridgeFinalized
+                                                                      └─ ETH released
 ```
 
-> Withdrawals from any OP Stack chain are subject to the fault-proof challenge period (~7 days) before funds are released on Ethereum. This is a protocol-level constraint, not a Hemi-specific delay.
+1. **`withdraw()` on Hemi** — burns the ETH/ERC-20 and emits `ETHBridgeInitiated`. This is
+   just the L2 side; nothing on Ethereum has happened yet.
+2. **`proveWithdrawalTransaction` on `OptimismPortal`** — anyone (typically the withdrawing
+   user, or a relayer on their behalf) submits a Merkle proof that the withdrawal is
+   included in `L2ToL1MessagePasser`'s state, checked against the L2 output root posted to
+   `OptimismPortal`. This can only be submitted once that output root exists on L1
+   (usually within about an hour of the L2 block), but it is **not automatic** — someone
+   has to send this transaction. Emits `WithdrawalProven`, which starts the challenge clock.
+3. **~1 day challenge window** — Hemi's fault-proof window, shortened from the standard OP
+   Stack 7 days because Hemi anchors L2 output-root finality to Bitcoin via PoP rather than
+   relying solely on an optimistic dispute period. This part genuinely cannot be skipped —
+   it is a security property of the chain, not a relayer/liveness delay.
+4. **`finalizeWithdrawalTransaction` on `OptimismPortal`** — callable by anyone once the
+   window elapses. Releases the funds and emits `WithdrawalFinalized` on `OptimismPortal`
+   and `ETHBridgeFinalized` on the L1 `L1StandardBridgeProxy`.
+
+> **If a withdrawal looks "stuck" for days**, check whether it has even been proven yet
+> (step 2) before assuming the challenge window (step 3) is the bottleneck — an unproven
+> withdrawal waits indefinitely, not just ~1 day.
 
 ---
 

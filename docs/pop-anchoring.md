@@ -2,12 +2,31 @@
 
 Hemi anchors its blocks to Bitcoin through Proof-of-Publication (PoP). This is what gives Hemi "Bitcoin-grade" finality. This guide explains how it works and how to verify that a specific Hemi transaction is Bitcoin-final.
 
-| Network | `PoPPayoutsV2` Address |
-|---|---|
-| Hemi Sepolia | `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB` |
-| Hemi Mainnet | _confirm from explorer_ |
+| Network | `PoPPayoutsV2` Address | Notes |
+|---|---|---|
+| Hemi Sepolia | `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB` | Testnet |
+| Hemi Mainnet (canonical) | `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` | Used by Strait (`HEMI_POP_PAYOUTS_CONTRACT`) |
+| Hemi Mainnet (first deployment) | `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40` | Earlier deployment, same owner |
 
 > Source: [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts)
+
+---
+
+## Mainnet deployment status (as of June 2026)
+
+Two `PoPPayoutsV2` contracts were deployed on Hemi Mainnet by the Hemi team (owner `0xE067Dd6965bd87C81AbE658ed42FC02eB41d5Bd3`):
+
+- **First deployment** — `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40`, block 3,497,671, factory `0xf9705145175800f6f2e4a81261a4cb5406da6023`
+- **Canonical deployment** — `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b`, block 3,497,724, factory `0x92f03ea43ee029dbd28b63029d6f07e1efdb7a1a`
+
+**`mintPoPRewards()` has never been called on either contract** — `lastBlockRewarded = 0` on both as of June 30, 2026. PoP payouts are not yet activated on mainnet.
+
+Practical impact: BTC→Hemi deposits already reach `FINALIZED` status at Hemi mint — the user has their hBTC regardless of PoP activation. The `popAnchored` field will remain `false` on all deposits until the Hemi team activates the system by calling `mintPoPRewards()` for the first time. Strait is wired to watch `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` via `HEMI_POP_PAYOUTS_CONTRACT` and will begin updating `popAnchored` automatically once `PayoutRoundExecuted` events start firing.
+
+**Open questions for the Hemi team:**
+- Which deployment is considered canonical for integrators?
+- When will PoP payout activation happen?
+- Who calls `mintPoPRewards()` — the sequencer, a multisig, or an automated keeper?
 
 ---
 
@@ -109,11 +128,11 @@ cast call 0x4a3b61C586DB4CD219E85aC0697b66916c7457AB \
 
 ```javascript
 pop.on("PayoutRoundExecuted", (blockRewarded, rewardPool, popScore) => {
-    // All pending transfers with mint block in (blockRewarded-25, blockRewarded]
-    // are now Bitcoin-final.
+    // All BTC→Hemi deposits with mint block in (blockRewarded-25, blockRewarded]
+    // are now Bitcoin-anchored. Status stays FINALIZED — only popAnchored flips.
     for (const transfer of pendingTransfers) {
         if (keystoneCovers(Number(blockRewarded), transfer.hemiMintBlock)) {
-            transfer.status = "FINALIZED";
+            transfer.popAnchored = true;
             transfer.popKeystoneBlock = Number(blockRewarded);
             transfer.popScore = Number(popScore);
         }
@@ -161,17 +180,33 @@ for (let block = 1; block <= 50; block++) {
 
 ---
 
-## Two-stage finality model
+## Finality model
 
-This is the data no generic EVM indexer can produce for Hemi:
+Strait separates **transfer completion** from **Bitcoin-grade anchoring**:
 
 ```
-BTC deposit observed        → INITIATED   (~immediate)
-Hemi mint confirmed         → ANCHORED    (~minutes, Hemi consensus)
-PoP keystone fires          → FINALIZED   (~90 min, Bitcoin-anchored)
+BTC deposit observed        → INITIATED     (~immediate)
+Hemi mint confirmed         → FINALIZED     (~minutes, Hemi consensus)
+PoP keystone fires          → popAnchored=true  (~90 min, Bitcoin-anchored)
 ```
 
-`FINALIZED` means the transaction is anchored to Bitcoin and safe to settle against. For a lending protocol, a treasury, or a compliance tool, the difference between "confirmed on Hemi" and "anchored to Bitcoin" is the difference between probabilistic and Bitcoin-grade finality.
+`FINALIZED` means the recipient has their hBTC — the transfer is complete. `popAnchored=true` is an additional signal that the Hemi mint block is anchored to Bitcoin and safe to settle against with Bitcoin-grade finality.
+
+For most consumer use cases (wallets, bridge UIs), `FINALIZED` is sufficient. For high-value settlement (lending collateral, treasury, compliance), check `popAnchored=true` as well.
+
+```javascript
+// Wait for funds available
+if (transfer.status === "FINALIZED") {
+    showFundsAvailable(transfer);
+}
+
+// Also wait for Bitcoin-grade finality
+if (transfer.status === "FINALIZED" && transfer.popAnchored) {
+    releaseLoanCollateral(transfer);
+}
+```
+
+The `popKeystoneBlock` and `popScore` fields carry the specific keystone and PoP quality score when anchored.
 
 ---
 

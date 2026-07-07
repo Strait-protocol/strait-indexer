@@ -13,13 +13,14 @@ use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::GraphQL;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{Method, StatusCode},
     response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
 use serde::Deserialize;
 use serde_json::json;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use uuid::Uuid;
 
@@ -38,6 +39,13 @@ pub async fn serve(config: ApiConfig, db: Database) -> anyhow::Result<()> {
     let schema = crate::graphql::build_schema(db.clone());
     let state = AppState { db: Arc::new(db) };
 
+    // Strait is a public read API — every route here is read-only (GET, plus
+    // POST for GraphQL query execution), so any origin may call it.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/health/db", get(health_db))
@@ -48,7 +56,8 @@ pub async fn serve(config: ApiConfig, db: Database) -> anyhow::Result<()> {
             "/graphql",
             get(graphiql).post_service(GraphQL::new(schema)),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()

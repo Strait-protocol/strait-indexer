@@ -63,7 +63,7 @@ impl EvmIngester {
 
     /// Run the ingester, watching for new blocks and processing events.
     #[instrument(skip(self), fields(chain = %self.config.chain_id))]
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         info!("Starting EVM ingester for chain {}", self.config.chain_id);
 
         let mut last_block = self.get_start_block().await?;
@@ -107,7 +107,7 @@ impl EvmIngester {
     ///
     /// Priority: persisted checkpoint → configured `start_block` (backfill) →
     /// near the chain tip.
-    async fn get_start_block(&self) -> Result<u64> {
+    async fn get_start_block(&mut self) -> Result<u64> {
         // 1. Resume from a persisted checkpoint if one exists.
         let repo = CheckpointRepo::new(&self.db);
         if let Some(cp) = repo.get(self.chain).await? {
@@ -117,6 +117,13 @@ impl EvmIngester {
                     block = cp.block_height,
                     "Resuming from persisted checkpoint"
                 );
+                // Seed the reorg detector with the checkpoint hash so a reorg
+                // that happened while the node was down is caught on the first
+                // poll (the recorded hash won't match the canonical chain).
+                if !cp.block_hash.is_empty() {
+                    self.reorg_detector
+                        .record_block_with_hash(cp.block_height as u64, cp.block_hash.clone());
+                }
                 return Ok(cp.block_height as u64);
             }
         }
@@ -148,45 +155,126 @@ impl EvmIngester {
     }
 
     /// Process new blocks and emit events.
-    async fn process_new_blocks(&self, last_block: &u64) -> Result<u64> {
+    async fn process_new_blocks(&mut self, last_block: &u64) -> Result<u64> {
         let latest = self.provider
             .get_block_number()
             .await
             .map_err(|e| StraitError::EvmProvider(format!("Failed to get block number: {}", e)))?;
-        
+
         let confirmed = latest.saturating_sub(self.config.confirmation_depth as u64);
-        
+
         if confirmed <= *last_block {
             debug!("No new confirmed blocks (latest={}, confirmed={})", latest, confirmed);
             return Ok(*last_block);
         }
-        
-        // Check for reorgs using the detector
-        if self.reorg_detector.detect_reorg(&*self.provider, *last_block).await? {
-            warn!("Reorg detected at block {}", *last_block);
-            // Reorg detected - caller should handle by rolling back
-            return Err(StraitError::Chain(format!("Reorg detected at block {}", *last_block)));
+
+        // Reorg check: compare the recorded per-window block hashes against the
+        // canonical chain. On divergence, retract affected transfers, roll the
+        // checkpoint back, and resume scanning from just before the fork.
+        if let Some(affected_from) = self
+            .reorg_detector
+            .find_reorg_point(&*self.provider)
+            .await?
+        {
+            return self.handle_reorg_detected(affected_from).await;
         }
-        
+
         // Scan in windows: one get_logs call covers up to LOG_RANGE blocks, and we only
         // fetch block headers for the (few) blocks that actually carry tunnel events.
         // This keeps RPC usage far below per-block scanning — important on rate-limited
         // public endpoints — and we checkpoint once per window (re-processing a window
         // after a crash is harmless, as all writes are idempotent upserts).
-        const LOG_RANGE: u64 = 100;
+        let log_range = self.config.log_range.max(1);
+        let backfilling = confirmed.saturating_sub(*last_block) > log_range;
         let mut new_last = *last_block;
         while new_last < confirmed {
             let from = new_last + 1;
-            let to = (from + LOG_RANGE - 1).min(confirmed);
+            let to = (from + log_range - 1).min(confirmed);
             let to_hash = self.process_block_range(from, to).await?;
             self.save_checkpoint(to, to_hash).await?;
+            self.reorg_detector
+                .record_block_with_hash(to, to_hash.to_string());
             new_last = to;
+            // Throttle during backfill to avoid hammering the RPC.
+            if backfilling && new_last < confirmed {
+                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            }
         }
 
         // Heartbeat so a caught-up node is visibly alive (range scanning is otherwise
         // silent for blocks with no tunnel events).
         info!("indexed up to block {} (chain tip {})", new_last, latest);
         Ok(new_last)
+    }
+
+    /// React to a detected reorg: emit a `BlockReorg` event (so the join engine
+    /// retracts affected transfers), roll the persisted checkpoint back to just
+    /// before the fork, and return the new resume block so the run loop
+    /// re-scans the affected range against the canonical chain.
+    async fn handle_reorg_detected(&mut self, affected_from: u64) -> Result<u64> {
+        let resume = affected_from.saturating_sub(1);
+        let depth = self
+            .reorg_detector
+            .highest_processed()
+            .unwrap_or(affected_from)
+            .saturating_sub(resume) as u32;
+
+        warn!(
+            chain = %self.chain,
+            affected_from,
+            resume,
+            depth,
+            "Reorg detected — retracting affected transfers and re-scanning"
+        );
+
+        // Best-effort tip hashes for the reorg event (informational).
+        let new_tip = self
+            .fetch_block_header(resume)
+            .await
+            .map(|(h, _)| strait_core::types::BlockHash(h.0))
+            .unwrap_or(strait_core::types::BlockHash([0u8; 32]));
+        let old_tip = strait_core::types::BlockHash([0u8; 32]);
+
+        let event = match self.chain {
+            Chain::Hemi => RawEvent::Hemi(HemiEvent::BlockReorg {
+                old_tip,
+                new_tip,
+                depth,
+                affected_from_block: affected_from,
+            }),
+            Chain::Ethereum => RawEvent::Ethereum(EthereumEvent::BlockReorg {
+                old_tip,
+                new_tip,
+                depth,
+                affected_from_block: affected_from,
+            }),
+            Chain::Bitcoin => {
+                return Err(StraitError::Internal(
+                    "EvmIngester cannot serve the Bitcoin chain".into(),
+                ))
+            }
+        };
+        self.event_tx
+            .send(event)
+            .await
+            .map_err(|_| StraitError::Internal("event channel closed".into()))?;
+
+        // Roll the persisted checkpoint back so a crash mid-rescan resumes
+        // from before the fork, then drop the invalidated detector entries.
+        let resume_hash = self
+            .fetch_block_header(resume)
+            .await
+            .map(|(h, _)| h.to_string())
+            .unwrap_or_default();
+        let repo = CheckpointRepo::new(&self.db);
+        repo.rollback(self.chain, resume as i64, &resume_hash).await?;
+        self.reorg_detector.handle_reorg(affected_from).await?;
+        if !resume_hash.is_empty() {
+            self.reorg_detector
+                .record_block_with_hash(resume, resume_hash);
+        }
+
+        Ok(resume)
     }
 
     /// Scan a window of blocks `[from, to]` with a single get_logs call, process any
@@ -261,6 +349,20 @@ impl EvmIngester {
             if !btc.is_empty() {
                 addresses.push(btc.parse().map_err(|e| {
                     StraitError::Parse(format!("Invalid BTC tunnel contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(portal) = self.config.opt_portal_contract.as_deref() {
+            if !portal.is_empty() {
+                addresses.push(portal.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid OptimismPortal contract address: {}", e))
+                })?);
+            }
+        }
+        if let Some(pop) = self.config.pop_payouts_contract.as_deref() {
+            if !pop.is_empty() {
+                addresses.push(pop.parse().map_err(|e| {
+                    StraitError::Parse(format!("Invalid PoPPayoutsV2 contract address: {}", e))
                 })?);
             }
         }
@@ -407,6 +509,31 @@ impl EvmIngester {
                     ).await?;
                 }
             }
+        } else if topic0 == topics::withdrawal_challenge_success() {
+            // WithdrawalChallengeSuccess(indexed vault, indexed withdrawer, indexed uuid)
+            // Operator failed to pay within the deadline — hBTC re-minted to withdrawer.
+            // uuid is indexed (uint64 in topic[3]).
+            if let Some(withdrawer_t) = log_topics.get(2) {
+                let withdrawer = addr_from_topic(withdrawer_t);
+                let uuid = log_topics.get(3)
+                    .map(|t| u64::from_be_bytes(t.0[24..32].try_into().unwrap_or([0u8; 8])))
+                    .unwrap_or(0);
+                info!(
+                    uuid,
+                    withdrawer = %hex::encode(withdrawer.0),
+                    tx = %hex::encode(tx_hash.0),
+                    "WithdrawalChallengeSuccess — operator failed to pay, withdrawal FAILED"
+                );
+                self.event_tx.send(RawEvent::Hemi(HemiEvent::WithdrawalChallengeSuccess {
+                    uuid,
+                    withdrawer,
+                    tx_hash: TxHash(tx_hash.0),
+                    block_number: block_num,
+                    block_time,
+                    log_index,
+                })).await.map_err(|_| StraitError::Internal("event channel closed".into()))?;
+            }
+
         // ── PoPPayoutsV2 events ────────────────────────────────────────────────
 
         } else if topic0 == topics::payout_round_executed() {
@@ -431,6 +558,23 @@ impl EvmIngester {
             if let Some(vault_t) = log_topics.get(3) {
                 let vault_address = addr_from_topic(vault_t);
                 info!(vault = %hex::encode(vault_address.0), "New BTC tunnel vault created — add to watched addresses");
+            }
+
+        // ── OptimismPortal events (HEMI_TO_ETH two-step withdrawal) ──────────
+        //
+        // WithdrawalProven fires when proveWithdrawalTransaction is called, starting
+        // the 1-day OP Stack challenge window. Only watched when ETH_OPT_PORTAL_CONTRACT
+        // is configured (not a standard bridge address).
+
+        } else if topic0 == topics::withdrawal_proven() {
+            // WithdrawalProven(indexed bytes32 withdrawalHash, indexed address from, indexed address to)
+            if let (Some(hash_t), Some(from_t), Some(to_t)) =
+                (log_topics.get(1), log_topics.get(2), log_topics.get(3))
+            {
+                let withdrawal_hash = TxHash(hash_t.0);
+                let from = addr_from_topic(from_t);
+                let to   = addr_from_topic(to_t);
+                self.handle_withdrawal_proven(withdrawal_hash, from, to, tx_hash, block_num, log_index, block_time).await?;
             }
         } else {
             debug!("Unknown event topic {:?}, skipping", topic0);
@@ -790,6 +934,73 @@ impl EvmIngester {
             IBitcoinTunnelManager::initiateWithdrawalCall::abi_decode(tx.input.as_ref(), false)
                 .ok()?;
         Some(decoded.btcAddress)
+    }
+
+    // ── OptimismPortal handler (HEMI_TO_ETH two-step withdrawal) ─────────────
+
+    /// Handle WithdrawalProven — `proveWithdrawalTransaction` was called on OptimismPortal,
+    /// starting the 1-day OP Stack challenge window for a HEMI_TO_ETH withdrawal.
+    ///
+    /// Emits a `WithdrawalProven` event to the channel and directly advances the
+    /// matching DB transfer from INITIATED → PROVING.
+    ///
+    /// `WithdrawalProven` carries no amount, so matching is by `to` (recipient) address
+    /// only — FIFO ordering (oldest INITIATED first) handles same-user concurrent
+    /// withdrawals correctly.
+    async fn handle_withdrawal_proven(
+        &self,
+        withdrawal_hash: TxHash,
+        from: Address,
+        to: Address,
+        tx_hash: B256,
+        block_num: u64,
+        log_index: u32,
+        block_time: DateTime<Utc>,
+    ) -> Result<()> {
+        info!(
+            withdrawal_hash = %withdrawal_hash,
+            from = %hex::encode(from.0),
+            to   = %hex::encode(to.0),
+            "WithdrawalProven — OP Stack 1-day challenge window started"
+        );
+
+        let event = RawEvent::Ethereum(EthereumEvent::WithdrawalProven {
+            withdrawal_hash,
+            from,
+            to,
+            tx_hash: TxHash(tx_hash.0),
+            block_number: block_num,
+            block_time,
+            log_index,
+        });
+        self.event_tx.send(event).await
+            .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
+
+        // DB-backed advance: find the oldest INITIATED HEMI_TO_ETH withdrawal for
+        // this recipient and advance it to PROVING.
+        let recipient = format!("0x{}", hex::encode(to.0));
+        let repo = TunnelTransferRepo::new(&self.db);
+        match repo.find_eth_withdrawal_for_proving(&recipient).await {
+            Ok(Some(transfer)) => {
+                match repo.set_eth_withdrawal_proving(transfer.id, block_time).await {
+                    Ok(()) => info!(
+                        transfer_id = %transfer.id,
+                        block = block_num,
+                        "HEMI_TO_ETH withdrawal INITIATED → PROVING (challenge window open)"
+                    ),
+                    Err(e) => warn!(error = %e, "DB proving write failed for ETH withdrawal"),
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    recipient = %recipient,
+                    "WithdrawalProven: no INITIATED HEMI_TO_ETH withdrawal found in DB"
+                );
+            }
+            Err(e) => warn!(error = %e, "DB lookup failed for withdrawal proving"),
+        }
+
+        Ok(())
     }
 }
 

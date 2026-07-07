@@ -57,6 +57,17 @@ Commonly used utility contracts deployed on **Hemi**.
 |---|---|
 | `BitcoinKit v1` | `0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12` |
 
+### PoPPayoutsV2
+
+Two deployments exist on Hemi Mainnet (owner `0xE067Dd6965bd87C81AbE658ed42FC02eB41d5Bd3`). Strait uses the canonical deployment.
+
+| Deployment | Contract Address | Deployed Block | Factory |
+|---|---|---|---|
+| Canonical (used by Strait) | `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` | 3,497,724 | `0x92f03ea43ee029dbd28b63029d6f07e1efdb7a1a` |
+| First deployment | `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40` | 3,497,671 | `0xf9705145175800f6f2e4a81261a4cb5406da6023` |
+
+> **Activation status (June 2026):** `mintPoPRewards()` has never been called — `lastBlockRewarded = 0` on both contracts. PoP payouts are not yet active on mainnet.
+
 ---
 
 ### hVM Precompiles
@@ -294,3 +305,50 @@ interface IBitcoinKit {
 - **OP_RETURN parsing**: `getTransactionByTxId` returns `Output.isOpReturn` and `Output.opReturnData` — Strait iterates outputs to extract the Hemi destination address encoded in tunnel deposit transactions.
 - **Confirmation gating**: `getTxConfirmations` provides the confirmation count used to enforce the `BITCOIN_CONFIRMATION_DEPTH` threshold before emitting a `TunnelDeposit` event.
 - **Note**: `getBitcoinAddressBalance` returns `uint256` in the interface above (vs `uint64` in the v1 on-chain source). Use the on-chain ABI as the source of truth for the deployed version.
+
+---
+
+## Bitcoin Vault Custody Addresses
+
+`BitcoinTunnelManager` (mainnet): `0xEAcA824F46c000fB89403846Bb57e6b913321081`
+
+9 vaults total as of June 2026. Each vault is a `SimpleBitcoinVault` contract on Hemi with its own Bitcoin custody address. Vault 3 has not been configured with a Bitcoin address yet. Vaults 4 and 5 share the same Bitcoin address.
+
+| Vault Index | Hemi Contract Address | Bitcoin Custody Address |
+|---|---|---|
+| 0 | `0x3DA10b74bD339E69c1dE9408020cE640B012E8CC` | `18AVmm853HVhibPHMc3JRLXMynzKAbj6Po` |
+| 1 | `0xeCF9C248FC63857e217214dAa82C1083cE8645D9` | `1CY4RxCxmzDC1W1iL9edAtJF2CTGeaJMbC` |
+| 2 | `0x13ca60FeFBe278F34bbAC50cAa121802474FCa43` | `12LcfeGZYzbiUqcLq1UvmMdtKFNa4niLEZ` |
+| 3 | `0xaabd93f4324eaB9e2Df736FF17eA22C9Eb239B10` | _(none — vault not yet configured)_ |
+| 4 | `0x96aA8D0DEEE02bD3F283e6896F57e2206A42A581` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` |
+| 5 | `0x654cE308839484a8a199354FAaED286E7B0C3a02` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` (same as vault 4) |
+| 6 | `0x3A29d25c255D3C5Be67fAA105936c21a0251FA2a` | `1GawhMSUVu3bgRiNmejbVTBjpwBygGWSqf` |
+| 7 | `0x5E6AbAD42E63cd7E8CE156fB8a8F0a3aEE464E33` | `bc1q4lpa9d5zxehge7vx86784gcxy23hc3xwp3gl422venswe6pvhh5qpn9xfj` |
+| 8 | `0x58f7B8D7A7291AaECE0FEbb39aA4E877387e61E4` | `1QDhzsteETKuw1M5kWHEjzaAmHSGhpH8zr` |
+
+These 7 unique custody addresses are configured in `BITCOIN_TUNNEL_ADDRESSES` in `.env`. See [`docs/btc-tunnel-guide.md`](btc-tunnel-guide.md) for details on how the `CustodyWatcher` uses them.
+
+---
+
+## SimpleBitcoinVault — payout detection interface
+
+Each vault contract exposes `currentSweepUTXO()`, which returns the Bitcoin txid of the most recently confirmed withdrawal sweep. Strait's `BtcPayoutWatcher` uses this to finalize Hemi→BTC withdrawals when the payout UTXO has already been spent.
+
+```solidity
+interface ISimpleBitcoinVault {
+    /// Returns the Bitcoin txid (bytes32) of the most recent sweep transaction
+    /// confirmed by the vault operator via finalizeWithdrawal().
+    /// Returns zero (bytes32(0)) if no sweep has been processed yet.
+    function currentSweepUTXO() external view returns (bytes32);
+}
+```
+
+Selector: `0xe9beef3d`
+
+Configure via `HEMI_VAULT_CONTRACTS` in `.env` — a comma-separated list of vault EVM addresses in vault-index order (index 0 first):
+
+```env
+HEMI_VAULT_CONTRACTS=0x3da10b74...,0xecf9c248...,0x13ca60fe,...
+```
+
+If `HEMI_VAULT_CONTRACTS` is empty or unset, Phase 3 sweep detection is disabled and only Phase 2 UTXO polling runs.

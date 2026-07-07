@@ -71,6 +71,34 @@ manager.on("VaultCreated", (setupAdmin, operatorAdmin, vaultAddress) => {
 
 ---
 
+## Known mainnet vault custody addresses (June 2026)
+
+`BitcoinTunnelManager` (mainnet): `0xEAcA824F46c000fB89403846Bb57e6b913321081`
+
+9 vaults exist as of June 2026. The 7 unique Bitcoin custody addresses below are configured in `BITCOIN_TUNNEL_ADDRESSES` in `.env`.
+
+| Vault Index | Hemi Contract Address | Bitcoin Custody Address |
+|---|---|---|
+| 0 | `0x3DA10b74bD339E69c1dE9408020cE640B012E8CC` | `18AVmm853HVhibPHMc3JRLXMynzKAbj6Po` |
+| 1 | `0xeCF9C248FC63857e217214dAa82C1083cE8645D9` | `1CY4RxCxmzDC1W1iL9edAtJF2CTGeaJMbC` |
+| 2 | `0x13ca60FeFBe278F34bbAC50cAa121802474FCa43` | `12LcfeGZYzbiUqcLq1UvmMdtKFNa4niLEZ` |
+| 3 | `0xaabd93f4324eaB9e2Df736FF17eA22C9Eb239B10` | _(none — vault not yet configured)_ |
+| 4 | `0x96aA8D0DEEE02bD3F283e6896F57e2206A42A581` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` |
+| 5 | `0x654cE308839484a8a199354FAaED286E7B0C3a02` | `16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo` (same as vault 4) |
+| 6 | `0x3A29d25c255D3C5Be67fAA105936c21a0251FA2a` | `1GawhMSUVu3bgRiNmejbVTBjpwBygGWSqf` |
+| 7 | `0x5E6AbAD42E63cd7E8CE156fB8a8F0a3aEE464E33` | `bc1q4lpa9d5zxehge7vx86784gcxy23hc3xwp3gl422venswe6pvhh5qpn9xfj` |
+| 8 | `0x58f7B8D7A7291AaECE0FEbb39aA4E877387e61E4` | `1QDhzsteETKuw1M5kWHEjzaAmHSGhpH8zr` |
+
+**Notes:**
+
+- **Vault 3** has no Bitcoin custody address yet — it has not been configured by the operator.
+- **Vaults 4 and 5** share the same Bitcoin address (`16NuSCxDVCAXbKs9GRbjbHXbwGXu3tnPSo`). Deposits to that address are disambiguated by the `DepositConfirmed` event's `vault` field, not the Bitcoin address alone.
+- The `CustodyWatcher` uses the **BitcoinKit precompile on Hemi** to poll these addresses — no native Bitcoin node is required. `BITCOIN_RPC_URL` in `.env` is vestigial and only needed if you want direct Bitcoin RPC access for other purposes.
+- Without `BITCOIN_TUNNEL_ADDRESSES` set, BTC→Hemi deposits are still captured via Hemi's `DepositConfirmed` event but only appear after ~6 BTC confirmations (~1 hour). With addresses set, deposits appear as soon as the UTXO hits a custody address.
+- **Warning:** new vaults may be added over time. Monitor `VaultCreated` events or re-query `vaultCounter()` periodically and update `BITCOIN_TUNNEL_ADDRESSES` to keep the watch-set current.
+
+---
+
 ## OP_RETURN encoding
 
 A BTC deposit transaction must include an OP_RETURN output encoding the recipient's Hemi EVM address. The vault contract parses this from `output.script` (the full script including the OP_RETURN opcode), **not** from a decoded data field.
@@ -163,8 +191,19 @@ pub fn parse_hemi_destination(script: &[u8]) -> Option<[u8; 20]> {
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. DepositConfirmed event + hBTC minted to recipient        │
 │    depositTxId = the Bitcoin txid (cross-chain join key)    │
+│    → Strait marks transfer FINALIZED                        │
+└─────────────────────────────────────────────────────────────┘
+                          │  ~90 min (optional, async)
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. PoP keystone anchors the mint block to Bitcoin           │
+│    → Strait sets popAnchored=true (status stays FINALIZED)  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Finality model:** A deposit reaches `FINALIZED` as soon as the hBTC mint is confirmed on Hemi — the user has their funds. Bitcoin-grade finality (`popAnchored=true`) arrives asynchronously (~90 minutes) once a PoP keystone covers the mint block. The two are tracked separately so callers can gate on whichever guarantee they need.
+
+**Failure states:** A `BTC_TO_HEMI` deposit can reach `REORGED` if the Hemi mint transaction is rolled back by a Hemi chain reorganization before the deposit is indexed as FINALIZED. The Bitcoin-side transaction is unaffected — the user's BTC is still locked in the custody address and a new `DepositConfirmed` event will be emitted when the transaction is re-included. If you display transfer status to users, treat `REORGED` as retriable, not permanent.
 
 ### Indexing DepositConfirmed
 
@@ -199,15 +238,57 @@ manager.on("DepositConfirmed", (vault, recipient, depositTxId, depositSats, netS
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. Operator sends BTC to user's address                     │
-│    + OP_RETURN encoding the uuid                             │
+│    + OP_RETURN encoding the vault-specific uuid (4 bytes)   │
 └─────────────────────────────────────────────────────────────┘
-                          │  if operator fails to pay
+                          │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. challengeWithdrawal(uuid, extraInfo)                     │
+│ 3. Operator calls finalizeWithdrawal(txid, withdrawalIndex) │
+│    on SimpleBitcoinVault — records the Bitcoin txid         │
+│    No event is emitted. State stored silently in contract.  │
+└─────────────────────────────────────────────────────────────┘
+                          │  if operator fails to pay within deadline
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. challengeWithdrawal(uuid, extraInfo)                     │
+│    → WithdrawalChallengeSuccess emitted                     │
 │    → hBTC re-minted to original withdrawer                  │
+│    → Strait marks transfer FAILED                           │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Indexer finalization — two complementary approaches
+
+`SimpleBitcoinVault.finalizeWithdrawal(bytes32 txid, uint32 withdrawalIndex)` emits **no events**. Strait detects the payout via two fallback phases run on every poll cycle:
+
+**Phase 2 — UTXO polling** (`BtcPayoutWatcher`)
+
+Watches the withdrawal recipient's Bitcoin address via the BitcoinKit precompile (`getUTXOsForBitcoinAddress`). When an unspent output appears, the OP_RETURN is read to confirm the vault-specific uuid matches. Sets the transfer FINALIZED with the Bitcoin txid.
+
+- Works for fresh, still-unspent payouts
+- Fails if the recipient spends the UTXO before the watcher polls (typically 60-second window)
+
+**Phase 3 — Vault sweep txid** (`BtcPayoutWatcher.check_vault_sweeps`)
+
+Calls `currentSweepUTXO()` (selector `0xe9beef3d`) on each `SimpleBitcoinVault` contract. The vault stores the Bitcoin txid of its most recent confirmed sweep directly in contract storage, so payout detection works even when the UTXO has already been spent.
+
+```javascript
+// Read the latest sweep txid for a vault
+const CURRENT_SWEEP_UTXO_SELECTOR = "0xe9beef3d";
+const result = await provider.call({ to: vaultAddress, data: CURRENT_SWEEP_UTXO_SELECTOR });
+const sweepTxid = result; // bytes32 Bitcoin txid, zero if no sweep yet
+```
+
+The OP_RETURN in the sweep transaction carries the 4-byte vault-specific uuid (big-endian `uint32`) to identify which withdrawal was paid:
+
+```
+OP_RETURN script: 0x6a 0x04 <4 bytes big-endian vaultSpecificUuid>
+Example:          6a 04 00 00 03 38   →  vaultUuid = 824
+```
+
+Configure the vault contract addresses for Phase 3 via `HEMI_VAULT_CONTRACTS` in `.env` (ordered by vault index, comma-separated).
+
+**Remaining blind spot:** If Phase 2 misses a payout (UTXO already spent) AND the vault's `currentSweepUTXO` has since been overwritten by a newer sweep, the withdrawal stays INITIATED indefinitely. This requires either historical sweep tracking or scanning Bitcoin transactions directly.
 
 ### The uuid join key
 

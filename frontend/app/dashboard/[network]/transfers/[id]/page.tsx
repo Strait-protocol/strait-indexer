@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import CopyButton from "@/app/dashboard/CopyButton";
 import {
   getTransfer,
   formatAmount,
@@ -25,6 +26,7 @@ type Step = {
   block: number | null;
   done: boolean;
   detail?: string;
+  isFailed?: boolean;
 };
 
 export default async function TransferDetailPage({
@@ -38,7 +40,7 @@ export default async function TransferDetailPage({
 
   const t = await getTransfer(id, network);
 
-  if (!t) return <NotFound id={id} network={network} />;
+  if (!t) notFound();
 
   const s = statusStyle(t.status);
   const kind = transferKind(t.direction);
@@ -62,7 +64,10 @@ export default async function TransferDetailPage({
           <div className="mt-1 text-3xl font-semibold tabular-nums text-white">
             {formatAmount(t.asset, t.amount)}
           </div>
-          <div className="mt-2 font-mono text-xs text-zinc-500">{t.id}</div>
+          <div className="mt-2 flex items-center gap-1.5 font-mono text-xs text-zinc-500">
+            {t.id}
+            <CopyButton value={t.id} />
+          </div>
         </div>
         <span className={`inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5 text-sm ${s.text}`}>
           <span className={`h-2 w-2 rounded-full ${s.dot}`} />
@@ -99,11 +104,11 @@ export default async function TransferDetailPage({
             <Field label="Asset" value={t.asset} />
             <Field label="Direction" value={`${kind.label} (${kind.hint})`} />
             <Field label="Amount" value={formatAmount(t.asset, t.amount)} mono />
-            <Field label="Sender" value={shortHash(t.sender)} mono />
-            <Field label="Recipient" value={shortHash(t.recipient)} mono />
+            <Field label="Sender" value={shortHash(t.sender)} mono copyValue={t.sender} />
+            <Field label="Recipient" value={shortHash(t.recipient)} mono copyValue={t.recipient} />
             <div className="h-px bg-white/[0.06]" />
             <TxField
-              label="Source"
+              label="Source Tx"
               chain={t.sourceChain}
               hash={sourceObserved(t) ? t.sourceTxHash : null}
               block={sourceObserved(t) ? t.sourceBlock : null}
@@ -111,7 +116,7 @@ export default async function TransferDetailPage({
               network={network}
             />
             <TxField
-              label="Destination"
+              label="Destination Tx"
               chain={t.destChain}
               hash={t.destTxHash}
               block={t.destBlock}
@@ -131,24 +136,19 @@ export default async function TransferDetailPage({
 function buildTimeline(t: Transfer): Step[] {
   const inbound = t.direction === "IN";
   const failed = t.status === "FAILED" || t.status === "REORGED";
-  // PoP / Bitcoin-anchoring only applies to BTC routes. ETH/ERC-20 routes go
-  // straight from initiation to finalization — no keystone step.
-  const isBtcRoute = t.route === "BTC_TO_HEMI" || t.route === "HEMI_TO_BTC";
-
-  const popStep: Step = {
-    title: "Anchored to Bitcoin (PoP)",
-    chain: null,
-    hash: null,
-    block: t.popKeystoneBlock,
-    done: t.popAnchored,
-    detail: t.popAnchored ? `keystone #${t.popKeystoneBlock?.toLocaleString()}` : "awaiting keystone",
-  };
+  const failedDetail = t.status === "REORGED"
+    ? "rolled back by a chain reorg"
+    : t.route === "HEMI_TO_BTC"
+      ? "operator did not pay — hBTC refunded to sender"
+      : undefined;
   const finalStep: Step = {
     title: failed ? "Failed" : "Finalized",
     chain: null,
     hash: null,
     block: null,
     done: t.status === "FINALIZED" || failed,
+    detail: failed ? failedDetail : t.finalizedAt ? timeAgo(t.finalizedAt) : undefined,
+    isFailed: failed,
   };
 
   if (inbound) {
@@ -158,7 +158,7 @@ function buildTimeline(t: Transfer): Step[] {
       : srcObs
         ? "Locked on source chain"
         : "Locked on Ethereum (L1)";
-    const steps: Step[] = [
+    return [
       {
         title: srcLabel,
         chain: srcObs ? t.sourceChain : null,
@@ -168,43 +168,58 @@ function buildTimeline(t: Transfer): Step[] {
         detail: srcObs ? undefined : "L1 deposit not yet matched",
       },
       { title: "Minted on Hemi", chain: t.destChain, hash: t.destTxHash, block: t.destBlock, done: t.destTxHash != null },
+      finalStep,
     ];
-    if (isBtcRoute) steps.push(popStep);
-    steps.push(finalStep);
-    return steps;
   }
 
   // Outbound (withdrawal from Hemi)
-  const steps: Step[] = [
-    { title: "Burned on Hemi", chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true },
+  const burned: Step = { title: "Burned on Hemi", chain: t.sourceChain, hash: t.sourceTxHash, block: t.sourceBlock || null, done: true };
+
+  // HEMI_TO_ETH: 3-phase OP Stack withdrawal (burn → prove → release)
+  if (t.route === "HEMI_TO_ETH") {
+    const proven = t.status !== "INITIATED";
+    return [
+      burned,
+      {
+        title: "Proven on Ethereum L1",
+        chain: "ETHEREUM",
+        hash: null,
+        block: null,
+        done: proven,
+        detail: proven ? "1-day challenge window started" : "Submit proof on the Hemi bridge to begin",
+      },
+      { title: "Released on Ethereum", chain: t.destChain, hash: t.destTxHash, block: t.destBlock, done: t.destTxHash != null },
+      finalStep,
+    ];
+  }
+
+  return [
+    burned,
+    {
+      title: "Paid out on Bitcoin",
+      chain: t.destChain,
+      hash: t.destTxHash,
+      block: t.destBlock,
+      done: t.destTxHash != null,
+    },
+    finalStep,
   ];
-  if (isBtcRoute) steps.push(popStep);
-  steps.push({
-    title: t.destChain === "BITCOIN" ? "Paid out on Bitcoin" : "Released on destination",
-    chain: t.destChain,
-    hash: t.destTxHash,
-    block: t.destBlock,
-    done: t.destTxHash != null,
-  });
-  steps.push(finalStep);
-  return steps;
 }
 
 function TimelineStep({ step, last, network }: { step: Step; last: boolean; network: Network }) {
   const url = txExplorerUrl(step.chain, step.hash, network);
+  const dotColor = step.isFailed
+    ? "border-red-500 bg-red-500"
+    : step.done
+      ? "border-orange-400 bg-orange-400"
+      : "border-white/20 bg-[#0a0a0a]";
+  const lineColor = step.isFailed ? "bg-red-500/30" : step.done ? "bg-orange-400/40" : "bg-white/10";
   return (
     <li className="relative flex gap-4 pb-7 last:pb-0">
       {!last && (
-        <span
-          className={`absolute left-[7px] top-4 h-full w-px ${step.done ? "bg-orange-400/40" : "bg-white/10"}`}
-          aria-hidden
-        />
+        <span className={`absolute left-1.5 top-4 h-full w-px ${lineColor}`} aria-hidden />
       )}
-      <span
-        className={`relative z-10 mt-1 h-3.5 w-3.5 shrink-0 rounded-full border-2 ${
-          step.done ? "border-orange-400 bg-orange-400" : "border-white/20 bg-[#0a0a0a]"
-        }`}
-      />
+      <span className={`relative z-10 mt-1 h-3.5 w-3.5 shrink-0 rounded-full border-2 ${dotColor}`} />
       <div className="-mt-0.5">
         <div className={step.done ? "text-zinc-100" : "text-zinc-500"}>{step.title}</div>
         <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-xs text-zinc-500">
@@ -223,11 +238,14 @@ function TimelineStep({ step, last, network }: { step: Step; last: boolean; netw
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Field({ label, value, mono, copyValue }: { label: string; value: string; mono?: boolean; copyValue?: string }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <dt className="text-zinc-500">{label}</dt>
-      <dd className={`text-zinc-200 ${mono ? "font-mono" : ""}`}>{value}</dd>
+      <dd className={`flex items-center gap-1.5 text-zinc-200 ${mono ? "font-mono" : ""}`}>
+        {value}
+        {copyValue && <CopyButton value={copyValue} />}
+      </dd>
     </div>
   );
 }
@@ -241,13 +259,16 @@ function TxField({ label, chain, hash, block, fee, network }: { label: string; c
       <dd className="text-right">
         {hash ? (
           <>
-            {url ? (
-              <a href={url} target="_blank" rel="noopener noreferrer" className="font-mono text-zinc-200 hover:text-orange-400">
-                {shortHash(hash)} ↗
-              </a>
-            ) : (
-              <span className="font-mono text-zinc-200">{shortHash(hash)}</span>
-            )}
+            <div className="flex items-center justify-end gap-1.5">
+              {url ? (
+                <a href={url} target="_blank" rel="noopener noreferrer" className="font-mono text-zinc-200 hover:text-orange-400">
+                  {shortHash(hash)} ↗
+                </a>
+              ) : (
+                <span className="font-mono text-zinc-200">{shortHash(hash)}</span>
+              )}
+              <CopyButton value={hash} />
+            </div>
             <div className="text-xs text-zinc-500">
               {chain}{block ? ` · block ${block.toLocaleString()}` : ""}
             </div>
@@ -261,14 +282,3 @@ function TxField({ label, chain, hash, block, fee, network }: { label: string; c
   );
 }
 
-function NotFound({ id, network }: { id: string; network: Network }) {
-  return (
-    <div className="rounded-xl border border-dashed border-white/10 px-6 py-16 text-center">
-      <h1 className="text-lg font-semibold text-zinc-200">Transfer not found</h1>
-      <p className="mt-2 font-mono text-xs text-zinc-500">{id}</p>
-      <Link href={`/dashboard/${network}`} className="mt-4 inline-block text-sm text-orange-400 hover:text-orange-300">
-        ← Back to explorer
-      </Link>
-    </div>
-  );
-}

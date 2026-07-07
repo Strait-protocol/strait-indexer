@@ -1,0 +1,8 @@
+target/
+.git/
+frontend/
+docs/
+.env
+.env.testnet
+.env.*.local
+*.md

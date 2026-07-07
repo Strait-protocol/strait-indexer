@@ -19,11 +19,15 @@ pub struct AppConfig {
 /// Bitcoin chain configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct BitcoinConfig {
-    /// Bitcoin RPC URL (e.g., http://localhost:8332)
+    /// Bitcoin RPC URL. Legacy/optional: all Bitcoin state is currently read
+    /// through the BitcoinKit precompile on Hemi, so no Bitcoin node is needed.
+    #[serde(default)]
     pub rpc_url: String,
-    /// Bitcoin RPC username
+    /// Bitcoin RPC username (legacy/optional, see `rpc_url`).
+    #[serde(default)]
     pub rpc_user: String,
-    /// Bitcoin RPC password
+    /// Bitcoin RPC password (legacy/optional, see `rpc_url`).
+    #[serde(default)]
     pub rpc_password: String,
     /// Comma-separated list of tunnel custody addresses to watch
     pub tunnel_addresses: Vec<String>,
@@ -33,6 +37,23 @@ pub struct BitcoinConfig {
     /// Poll interval in seconds for checking new blocks
     #[serde(default = "default_bitcoin_poll_interval")]
     pub poll_interval_secs: u64,
+    /// Hemi RPC URL used exclusively by the custody watcher BitcoinKit precompile calls
+    /// (getUTXOsForBitcoinAddress). Defaults to HEMI_RPC_URL if unset.
+    /// Set via HEMI_BITCOIN_KIT_RPC_URL.
+    #[serde(default)]
+    pub bitcoin_kit_rpc_url: Option<String>,
+    /// Separate Hemi RPC URL used exclusively by the payout watcher BitcoinKit calls
+    /// (getUTXOsForBitcoinAddress, getTransactionByTxId, currentSweepUTXO).
+    /// Defaults to bitcoin_kit_rpc_url → HEMI_RPC_URL if unset.
+    /// Set via HEMI_PAYOUT_KIT_RPC_URL to spread load across endpoints.
+    #[serde(default)]
+    pub payout_kit_rpc_url: Option<String>,
+    /// Ordered list of SimpleBitcoinVault contract addresses on Hemi (index 0 first).
+    /// Used by the payout watcher to call currentSweepUTXO() per vault, detecting
+    /// BTC payouts without depending on UTXO availability.
+    /// Set via HEMI_VAULT_CONTRACTS (comma-separated EVM addresses).
+    #[serde(default)]
+    pub vault_contracts: Vec<String>,
 }
 
 /// EVM chain configuration (used for both Hemi and Ethereum)
@@ -55,6 +76,17 @@ pub struct EvmChainConfig {
     /// Only relevant for the Hemi chain config — ignored for Ethereum.
     #[serde(default)]
     pub bitcoin_kit_contract: Option<String>,
+    /// OptimismPortal contract address on Ethereum.
+    /// When set, the Ethereum ingester watches for WithdrawalProven events to
+    /// advance HEMI_TO_ETH withdrawals from INITIATED → PROVING (1-day window).
+    /// Set via ETH_OPT_PORTAL_CONTRACT. Only relevant for the Ethereum chain config.
+    #[serde(default)]
+    pub opt_portal_contract: Option<String>,
+    /// PoPPayoutsV2 contract on Hemi. When set, the Hemi ingester watches for
+    /// PayoutRoundExecuted events to advance BTC→Hemi transfers from INITIATED → ANCHORED.
+    /// Set via HEMI_POP_PAYOUTS_CONTRACT. Not relevant for the Ethereum chain config.
+    #[serde(default)]
+    pub pop_payouts_contract: Option<String>,
     /// Block number to start indexing from
     #[serde(default = "default_start_block")]
     pub start_block: u64,
@@ -64,6 +96,10 @@ pub struct EvmChainConfig {
     /// Poll interval in milliseconds for checking new blocks
     #[serde(default = "default_evm_poll_interval")]
     pub poll_interval_ms: u64,
+    /// Maximum block range per eth_getLogs request. Free-tier providers (e.g.
+    /// Alchemy free) cap this at 10; paid tiers typically allow 500–2000.
+    #[serde(default = "default_log_range")]
+    pub log_range: u64,
 }
 
 /// Database configuration
@@ -129,7 +165,7 @@ fn default_bitcoin_confirmation_depth() -> u32 {
 }
 
 fn default_bitcoin_poll_interval() -> u64 {
-    10
+    60
 }
 
 fn default_start_block() -> u64 {
@@ -142,6 +178,10 @@ fn default_evm_confirmation_depth() -> u32 {
 
 fn default_evm_poll_interval() -> u64 {
     1000
+}
+
+fn default_log_range() -> u64 {
+    100
 }
 
 fn default_max_connections() -> u32 {
@@ -211,6 +251,13 @@ impl AppConfig {
                     "BITCOIN_POLL_INTERVAL_SECS",
                     default_bitcoin_poll_interval(),
                 ),
+                bitcoin_kit_rpc_url: env_opt("HEMI_BITCOIN_KIT_RPC_URL"),
+                payout_kit_rpc_url: env_opt("HEMI_PAYOUT_KIT_RPC_URL"),
+                vault_contracts: env_str("HEMI_VAULT_CONTRACTS")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             },
             hemi: EvmChainConfig {
                 rpc_url: env_str("HEMI_RPC_URL"),
@@ -218,12 +265,15 @@ impl AppConfig {
                 tunnel_contract: env_str("HEMI_TUNNEL_CONTRACT"),
                 btc_tunnel_contract: env_opt("HEMI_BTC_TUNNEL_CONTRACT"),
                 bitcoin_kit_contract: env_opt("HEMI_BITCOIN_KIT_CONTRACT"),
+                opt_portal_contract: None,
+                pop_payouts_contract: env_opt("HEMI_POP_PAYOUTS_CONTRACT"),
                 start_block: env_parse("HEMI_START_BLOCK", default_start_block()),
                 confirmation_depth: env_parse(
                     "HEMI_CONFIRMATION_DEPTH",
                     HEMI_CONFIRMATION_DEPTH,
                 ),
                 poll_interval_ms: env_parse("HEMI_POLL_INTERVAL_MS", default_evm_poll_interval()),
+                log_range: env_parse("HEMI_LOG_RANGE", default_log_range()),
             },
             ethereum: EvmChainConfig {
                 rpc_url: env_str("ETH_RPC_URL"),
@@ -231,12 +281,15 @@ impl AppConfig {
                 tunnel_contract: env_str("ETH_TUNNEL_CONTRACT"),
                 btc_tunnel_contract: None,
                 bitcoin_kit_contract: None,
+                opt_portal_contract: env_opt("ETH_OPT_PORTAL_CONTRACT"),
+                pop_payouts_contract: None,
                 start_block: env_parse("ETH_START_BLOCK", default_start_block()),
                 confirmation_depth: env_parse(
                     "ETH_CONFIRMATION_DEPTH",
                     default_evm_confirmation_depth(),
                 ),
                 poll_interval_ms: env_parse("ETH_POLL_INTERVAL_MS", default_evm_poll_interval()),
+                log_range: env_parse("ETH_LOG_RANGE", default_log_range()),
             },
             database: DatabaseConfig {
                 url: env_str("DATABASE_URL"),
@@ -254,23 +307,11 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Validate that all required configuration is present
+    /// Validate that all required configuration is present.
+    ///
+    /// The Bitcoin RPC credentials are deliberately NOT required: all Bitcoin
+    /// state is read through the BitcoinKit precompile on Hemi.
     fn validate(&self) -> Result<()> {
-        if self.bitcoin.rpc_url.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_URL is required".to_string(),
-            ));
-        }
-        if self.bitcoin.rpc_user.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_USER is required".to_string(),
-            ));
-        }
-        if self.bitcoin.rpc_password.is_empty() {
-            return Err(StraitError::MissingConfig(
-                "BITCOIN_RPC_PASSWORD is required".to_string(),
-            ));
-        }
         if self.hemi.rpc_url.is_empty() {
             return Err(StraitError::MissingConfig(
                 "HEMI_RPC_URL is required".to_string(),
@@ -312,7 +353,7 @@ mod tests {
     #[test]
     fn test_default_values() {
         assert_eq!(default_bitcoin_confirmation_depth(), 6);
-        assert_eq!(default_bitcoin_poll_interval(), 10);
+        assert_eq!(default_bitcoin_poll_interval(), 60);
         assert_eq!(default_start_block(), 0);
         assert_eq!(default_evm_confirmation_depth(), 12);
         assert_eq!(default_evm_poll_interval(), 1000);
@@ -323,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let config = AppConfig {
+        let mut config = AppConfig {
             bitcoin: BitcoinConfig {
                 rpc_url: String::new(),
                 rpc_user: "user".to_string(),
@@ -331,6 +372,9 @@ mod tests {
                 tunnel_addresses: vec![],
                 confirmation_depth: 6,
                 poll_interval_secs: 10,
+                bitcoin_kit_rpc_url: None,
+                payout_kit_rpc_url: None,
+                vault_contracts: vec![],
             },
             hemi: EvmChainConfig {
                 rpc_url: "https://testnet.rpc.hemi.network/rpc".to_string(),
@@ -338,9 +382,12 @@ mod tests {
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
                 btc_tunnel_contract: Some("0x8221CFD3Eca3c5F9FA27b2AE774151642f1C449e".to_string()),
                 bitcoin_kit_contract: Some("0xeC9fa5daC1118963933e1A675a4EEA0009b7f215".to_string()),
+                opt_portal_contract: None,
+                pop_payouts_contract: Some("0x4a3b61C586DB4CD219E85aC0697b66916c7457AB".to_string()),
                 start_block: 0,
                 confirmation_depth: 3,
                 poll_interval_ms: 1000,
+                log_range: 100,
             },
             ethereum: EvmChainConfig {
                 rpc_url: "https://eth-sepolia.g.alchemy.com/v2/test".to_string(),
@@ -348,9 +395,12 @@ mod tests {
                 tunnel_contract: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
                 btc_tunnel_contract: None,
                 bitcoin_kit_contract: None,
+                opt_portal_contract: None,
+                pop_payouts_contract: None,
                 start_block: 0,
                 confirmation_depth: 12,
                 poll_interval_ms: 1000,
+                log_range: 100,
             },
             database: DatabaseConfig {
                 url: "postgres://postgres:password@localhost:5432/strait".to_string(),
@@ -362,7 +412,12 @@ mod tests {
             },
         };
 
-        // Should fail because bitcoin.rpc_url is empty
+        // Bitcoin RPC credentials are legacy/optional — everything is read via
+        // BitcoinKit on Hemi — so an empty bitcoin.rpc_url must NOT fail.
+        assert!(config.validate().is_ok());
+
+        // A missing Hemi RPC URL is a hard error.
+        config.hemi.rpc_url = String::new();
         assert!(config.validate().is_err());
     }
 }

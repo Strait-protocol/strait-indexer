@@ -77,6 +77,40 @@ impl<'a> CheckpointRepo<'a> {
         Ok(checkpoint)
     }
 
+    /// Force the checkpoint back to an earlier block after a reorg.
+    ///
+    /// Unlike `upsert` (which uses GREATEST to protect against accidental
+    /// regression), this explicitly allows the height to move backwards so the
+    /// ingester can re-scan the affected range.
+    pub async fn rollback(
+        &self,
+        chain: Chain,
+        block_height: i64,
+        block_hash: &str,
+    ) -> Result<Checkpoint> {
+        let chain_name = chain_to_string(chain);
+
+        let checkpoint = sqlx::query_as::<_, Checkpoint>(
+            r#"
+            INSERT INTO checkpoints (chain, block_height, block_hash)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chain) DO UPDATE
+            SET block_height = EXCLUDED.block_height,
+                block_hash   = EXCLUDED.block_hash,
+                updated_at   = NOW()
+            RETURNING *
+            "#,
+        )
+        .bind(chain_name)
+        .bind(block_height)
+        .bind(block_hash)
+        .fetch_one(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+
+        Ok(checkpoint)
+    }
+
     /// Get all checkpoints
     pub async fn get_all(&self) -> Result<Vec<Checkpoint>> {
         let checkpoints = sqlx::query_as::<_, Checkpoint>(

@@ -133,11 +133,14 @@ impl TransferState {
         }).collect()
     }
 
-    /// Return (id, hemi_mint_block) for all INITIATED transfers that have a
-    /// confirmed Hemi destination block — the set the keystone fan-out checks.
-    pub fn transfers_initiated_with_hemi_mint(&self) -> Vec<(uuid::Uuid, u64)> {
+    /// Return (id, hemi_mint_block) for all BTC→Hemi transfers that have a
+    /// confirmed Hemi mint but are not yet PoP-anchored — the set the keystone
+    /// fan-out checks. Mirrors the DB fallback query's semantics: BTC→Hemi
+    /// deposits are FINALIZED at mint time, so the filter is on `pop_anchored`,
+    /// not on status.
+    pub fn unanchored_btc_transfers_with_hemi_mint(&self) -> Vec<(uuid::Uuid, u64)> {
         self.transfers.values()
-            .filter(|t| matches!(t.status, TunnelStatus::Initiated))
+            .filter(|t| t.route == strait_core::types::TunnelRoute::BtcToHemi && !t.pop_anchored)
             .filter_map(|t| {
                 t.destination_tx.as_ref()
                     .filter(|tx| tx.chain == Chain::Hemi)
@@ -188,6 +191,51 @@ impl TransferState {
         self.chain_tips.get(chain).map(|b| b.height)
     }
 
+    /// Evict completed transfers from in-memory tracking so the state map does
+    /// not grow without bound over the life of the process. The database is the
+    /// source of truth; in-memory state only needs transfers that are still
+    /// actionable.
+    ///
+    /// A transfer is evictable once it reached a terminal status (FINALIZED /
+    /// FAILED / REORGED) and its terminal timestamp is older than `cutoff`.
+    /// BTC→Hemi deposits additionally wait for PoP anchoring — so the in-memory
+    /// keystone fan-out can still find them — up to the longer `anchor_cutoff`,
+    /// after which they are evicted anyway (the DB-backed keystone fallback
+    /// anchors them from there).
+    pub fn prune_completed(
+        &mut self,
+        cutoff: chrono::DateTime<Utc>,
+        anchor_cutoff: chrono::DateTime<Utc>,
+    ) -> usize {
+        let evict: Vec<Uuid> = self
+            .transfers
+            .values()
+            .filter(|t| {
+                let terminal = matches!(
+                    t.status,
+                    TunnelStatus::Finalized | TunnelStatus::Failed { .. } | TunnelStatus::Reorged { .. }
+                );
+                if !terminal {
+                    return false;
+                }
+                let done_at = t.finalized_at.unwrap_or(t.initiated_at);
+                if t.route == strait_core::types::TunnelRoute::BtcToHemi && !t.pop_anchored {
+                    return done_at <= anchor_cutoff;
+                }
+                done_at <= cutoff
+            })
+            .map(|t| t.id)
+            .collect();
+        let count = evict.len();
+        for id in &evict {
+            self.remove(id);
+        }
+        if count > 0 {
+            debug!(count, "evicted completed transfers from in-memory state");
+        }
+        count
+    }
+
     /// Remove a completed transfer from active tracking.
     pub fn remove(&mut self, id: &Uuid) -> Option<TunnelTransfer> {
         let transfer = self.transfers.remove(id);
@@ -205,12 +253,13 @@ impl TransferState {
     }
 
     /// Handle a reorg event — mark affected transfers as REORGED.
+    /// Returns the ids of the transfers retracted by *this* reorg.
     pub fn handle_reorg(
         &mut self,
         chain: &Chain,
         affected_from_block: u64,
         reorg_event: strait_core::types::ReorgEvent,
-    ) {
+    ) -> Vec<Uuid> {
         let affected_ids: Vec<Uuid> = self
             .transfers
             .iter()
@@ -236,7 +285,7 @@ impl TransferState {
             .map(|(id, _)| *id)
             .collect();
 
-        for id in affected_ids {
+        for id in &affected_ids {
             warn!(
                 transfer_id = %id,
                 chain = %chain,
@@ -244,7 +293,7 @@ impl TransferState {
                 "marking transfer as reorged"
             );
 
-            if let Some(transfer) = self.transfers.get_mut(&id) {
+            if let Some(transfer) = self.transfers.get_mut(id) {
                 transfer.reorg_events.push(reorg_event.clone());
                 transfer.status = TunnelStatus::Reorged {
                     retracted_at: Utc::now(),
@@ -252,6 +301,7 @@ impl TransferState {
                 transfer.finalized_at = Some(Utc::now());
             }
         }
+        affected_ids
     }
 }
 
@@ -265,8 +315,7 @@ impl Default for TransferState {
 mod tests {
     use super::*;
     use strait_core::types::{
-        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, Satoshi, TunnelDirection,
-        TunnelRoute, TxHash,
+        Address, Asset, BlockHash, ChainTransaction, ChainTxHash, TunnelDirection, TunnelRoute,
     };
     use chrono::Utc;
 
@@ -380,6 +429,48 @@ mod tests {
             },
         );
         assert_eq!(state.chain_tip_height(&Chain::Bitcoin), Some(800_000));
+    }
+
+    #[test]
+    fn test_prune_completed() {
+        let mut state = TransferState::new();
+        let now = Utc::now();
+        let hour_ago = now - chrono::Duration::hours(2);
+
+        // 1. An active (INITIATED) transfer — never evicted.
+        let active = make_test_transfer();
+        let active_id = active.id;
+        state.insert(active);
+
+        // 2. A finalized + PoP-anchored BTC transfer, completed long ago — evicted.
+        let mut done = make_test_transfer();
+        done.status = TunnelStatus::Finalized;
+        done.finalized_at = Some(hour_ago);
+        done.pop_anchored = true;
+        let done_id = done.id;
+        state.insert(done);
+
+        // 3. A finalized BTC transfer still awaiting its keystone — kept until
+        //    the (longer) anchor cutoff passes.
+        let mut waiting = make_test_transfer();
+        waiting.status = TunnelStatus::Finalized;
+        waiting.finalized_at = Some(hour_ago);
+        let waiting_id = waiting.id;
+        state.insert(waiting);
+
+        let pruned = state.prune_completed(
+            now - chrono::Duration::hours(1),
+            now - chrono::Duration::hours(24),
+        );
+        assert_eq!(pruned, 1);
+        assert!(state.get(&active_id).is_some(), "active transfer must survive");
+        assert!(state.get(&done_id).is_none(), "anchored+finalized must be evicted");
+        assert!(state.get(&waiting_id).is_some(), "un-anchored BTC deposit waits for its keystone");
+
+        // Once the anchor cutoff passes, the waiting transfer goes too.
+        let pruned = state.prune_completed(now, now);
+        assert_eq!(pruned, 1);
+        assert!(state.get(&waiting_id).is_none());
     }
 
     #[test]

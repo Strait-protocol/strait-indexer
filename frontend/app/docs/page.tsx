@@ -1,25 +1,28 @@
 import Link from "next/link";
+import DocsSidebars from "./DocsSidebars";
 
 export const metadata = {
   title: "Strait — Docs",
   description:
-    "Developer documentation for Strait: the project, the read API (GraphQL + REST), the data model, the contract addresses it indexes, and how to run your own node.",
+    "Developer documentation for Strait: the project, the read API (GraphQL + REST), the data model, and the contract addresses it indexes.",
 };
 
 export default function DocsPage() {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans">
       <DocsNav />
-      <main className="max-w-4xl mx-auto px-6 pt-28 pb-24 space-y-16">
-        <Hero />
-        <Overview />
-        <DataModel />
-        <Lifecycle />
-        <UsingTheApi />
-        <Contracts />
-        <SelfHost />
-        <Footer />
-      </main>
+      <DocsSidebars />
+      <div className="xl:ml-56 xl:mr-52">
+        <main className="max-w-3xl mx-auto px-6 pt-28 pb-24 space-y-16">
+          <Hero />
+          <Overview />
+          <DataModel />
+          <Lifecycle />
+          <UsingTheApi />
+          <Contracts />
+          <Footer />
+        </main>
+      </div>
     </div>
   );
 }
@@ -65,14 +68,13 @@ function Hero() {
         tunnels and serves it as a plain HTTP read API. No SDK required — integrate from any
         language with a normal HTTP client.
       </p>
-      <nav className="mt-6 flex flex-wrap gap-2 text-sm">
+      <nav className="mt-6 flex flex-wrap gap-2 text-sm xl:hidden">
         {[
           ["Overview", "overview"],
           ["The data", "data"],
           ["Lifecycle", "lifecycle"],
           ["Using the API", "api"],
           ["Contracts", "contracts"],
-          ["Self-host", "self-host"],
         ].map(([label, id]) => (
           <a
             key={id}
@@ -117,7 +119,7 @@ function DataModel() {
     ["route", "Enum", "BTC_TO_HEMI · HEMI_TO_BTC · ETH_TO_HEMI · HEMI_TO_ETH."],
     ["amount", "String", "Atomic units (satoshis or wei) as a decimal string."],
     ["sender / recipient", "String", "Origin / destination address (EVM 0x… or Bitcoin)."],
-    ["status", "Enum", "INITIATED · ANCHORED · FINALIZED · FAILED · REORGED."],
+    ["status", "Enum", "INITIATED · PROVING · FINALIZED · FAILED · REORGED."],
     ["sourceChain / sourceTxHash / sourceBlock", "—", "The initiating leg."],
     ["destChain / destTxHash / destBlock", "—", "The counterpart leg (null until it confirms)."],
     ["popAnchored / popKeystoneBlock / popScore", "—", "Bitcoin (PoP) anchoring fields."],
@@ -162,30 +164,128 @@ function Lifecycle() {
   return (
     <Section id="lifecycle" title="The transfer lifecycle">
       <p>
-        <Code>status</Code> is what you poll for. The progression depends on the route:
+        <Code>status</Code> is what you poll for. Each route has a different sequence of
+        on-chain events before it reaches <Code>FINALIZED</Code>.
       </p>
-      <Pre>{`ETH_TO_HEMI  (deposit) :  INITIATED ─────────────► FINALIZED
-BTC_TO_HEMI  (deposit) :  INITIATED ──► ANCHORED ─► FINALIZED
-HEMI_TO_ETH  (withdraw):  INITIATED ─────────────► FINALIZED  (after L1 challenge)
-HEMI_TO_BTC  (withdraw):  INITIATED ──► ANCHORED ─► FINALIZED`}</Pre>
-      <ul className="space-y-1.5 text-zinc-300">
-        <li>
-          <Code>INITIATED</Code> — seen on its source chain.
-        </li>
-        <li>
-          <Code>ANCHORED</Code> — (BTC routes) committed to Bitcoin via Proof-of-Proof.
-        </li>
-        <li>
-          <Code>FINALIZED</Code> — complete and irreversible.
-        </li>
-        <li>
-          <Code>FAILED</Code> / <Code>REORGED</Code> — terminal failure / rolled back by a reorg.
-        </li>
-      </ul>
-      <p className="text-zinc-400">
-        A robust integration treats <Code>FINALIZED</Code> as &quot;done&quot; and anything
-        else as &quot;in flight.&quot;
-      </p>
+
+      {/* ETH → Hemi */}
+      <div id="lifecycle-eth-to-hemi" className="scroll-mt-24 space-y-3">
+        <h3 className="text-base font-semibold text-white">
+          ETH → Hemi <span className="ml-2 text-xs font-normal text-zinc-500">deposit · ~2 minutes</span>
+        </h3>
+        <Pre>{`INITIATED ──────────────────────────────────────────► FINALIZED`}</Pre>
+        <ol className="space-y-3 text-sm text-zinc-300">
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
+            <div>
+              <span className="font-medium text-white">User calls <Code>depositETH</Code> on the L1StandardBridge</span>
+              <p className="mt-0.5 text-zinc-400">Funds are locked on Ethereum. Strait sees <Code>ETHBridgeInitiated</Code> and records the transfer as <Code>INITIATED</Code>.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
+            <div>
+              <span className="font-medium text-white">OP Stack relays the deposit to Hemi <span className="font-normal text-zinc-500">(~2 min)</span></span>
+              <p className="mt-0.5 text-zinc-400">The sequencer picks up the L1 deposit and finalizes it on L2. Strait sees <Code>ETHBridgeFinalized</Code> on Hemi and advances to <Code>FINALIZED</Code>.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      {/* BTC → Hemi */}
+      <div id="lifecycle-btc-to-hemi" className="scroll-mt-24 space-y-3">
+        <h3 className="text-base font-semibold text-white">
+          BTC → Hemi <span className="ml-2 text-xs font-normal text-zinc-500">deposit · ~1–2 hours</span>
+        </h3>
+        <Pre>{`INITIATED ──────────────────────────────────────────► FINALIZED`}</Pre>
+        <ol className="space-y-3 text-sm text-zinc-300">
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
+            <div>
+              <span className="font-medium text-white">User sends BTC to the vault custody address</span>
+              <p className="mt-0.5 text-zinc-400">Strait observes the Bitcoin UTXO and records the transfer as <Code>INITIATED</Code>.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
+            <div>
+              <span className="font-medium text-white">6 Bitcoin confirmations accumulate, hBTC is minted <span className="font-normal text-zinc-500">(~1 hour)</span></span>
+              <p className="mt-0.5 text-zinc-400">An operator calls <Code>confirmDeposit</Code> on BitcoinTunnelManager, minting hBTC to the recipient. Strait sees <Code>DepositConfirmed</Code> and advances to <Code>FINALIZED</Code> — the user has their funds.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">3</span>
+            <div>
+              <span className="font-medium text-white">PoP keystone anchors the Hemi block <span className="font-normal text-zinc-500">(async, ~90 min — optional)</span></span>
+              <p className="mt-0.5 text-zinc-400"><Code>PoPPayoutsV2.PayoutRoundExecuted</Code> fires for the keystone covering the mint block. <Code>status</Code> stays <Code>FINALIZED</Code>; Strait sets <Code>popAnchored=true</Code>. This upgrades the transfer to Bitcoin-grade finality independently of <Code>FINALIZED</Code>.</p>
+              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of June 2026. <Code>popAnchored</Code> stays false, but transfers still reach <Code>FINALIZED</Code> at mint.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      {/* Hemi → ETH */}
+      <div id="lifecycle-hemi-to-eth" className="scroll-mt-24 space-y-3">
+        <h3 className="text-base font-semibold text-white">
+          Hemi → ETH <span className="ml-2 text-xs font-normal text-zinc-500">withdrawal · ~1 day</span>
+        </h3>
+        <Pre>{`INITIATED ──► PROVING ─────────────────────────────► FINALIZED
+              (1-day challenge window)`}</Pre>
+        <ol className="space-y-3 text-sm text-zinc-300">
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
+            <div>
+              <span className="font-medium text-white">User calls <Code>withdraw</Code> on the L2StandardBridge on Hemi</span>
+              <p className="mt-0.5 text-zinc-400">ETH is burned on Hemi. Strait sees <Code>ETHBridgeInitiated</Code> and records the transfer as <Code>INITIATED</Code>.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
+            <div>
+              <span className="font-medium text-white">User calls <Code>proveWithdrawalTransaction</Code> on OptimismPortal <span className="font-normal text-zinc-500">(after output root is published, ~1 hour)</span></span>
+              <p className="mt-0.5 text-zinc-400">The withdrawal is proven against the L2 output root on Ethereum. Strait sees <Code>WithdrawalProven</Code> and advances to <Code>PROVING</Code>. The 1-day challenge window begins.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">3</span>
+            <div>
+              <span className="font-medium text-white">Challenge window elapses <span className="font-normal text-zinc-500">(~1 day after proving)</span></span>
+              <p className="mt-0.5 text-zinc-400">Anyone calls <Code>finalizeWithdrawalTransaction</Code> on OptimismPortal. ETH is released on Ethereum. Strait sees <Code>ETHBridgeFinalized</Code> on L1 and advances to <Code>FINALIZED</Code>.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      {/* Hemi → BTC */}
+      <div id="lifecycle-hemi-to-btc" className="scroll-mt-24 space-y-3">
+        <h3 className="text-base font-semibold text-white">
+          Hemi → BTC <span className="ml-2 text-xs font-normal text-zinc-500">withdrawal · ~2–14 hours</span>
+        </h3>
+        <Pre>{`INITIATED ──────────────────────────────────────────► FINALIZED`}</Pre>
+        <ol className="space-y-3 text-sm text-zinc-300">
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
+            <div>
+              <span className="font-medium text-white">User calls <Code>initiateWithdrawal</Code> on BitcoinTunnelManager</span>
+              <p className="mt-0.5 text-zinc-400">hBTC is burned on Hemi. Strait sees <Code>WithdrawalInitiated</Code> and records the transfer as <Code>INITIATED</Code>. A uuid is embedded in the event for cross-chain matching.</p>
+            </div>
+          </li>
+          <li className="flex gap-3">
+            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
+            <div>
+              <span className="font-medium text-white">Vault operator pays out on Bitcoin <span className="font-normal text-zinc-500">(up to ~14 hours)</span></span>
+              <p className="mt-0.5 text-zinc-400">The operator broadcasts a Bitcoin transaction with the uuid in an <Code>OP_RETURN</Code> output. Strait matches it by uuid and advances to <Code>FINALIZED</Code>.</p>
+              <p className="mt-1 text-zinc-500 text-xs">If the operator misses the deadline, anyone can call <Code>challengeWithdrawal</Code> on <Code>BitcoinTunnelManager</Code>. On success, the contract re-mints hBTC to the original sender and Strait marks the transfer <Code>FAILED</Code>.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+
+      <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-5 py-4 text-sm text-zinc-400 space-y-1">
+        <p><span className="text-white font-medium">FAILED</span> — a terminal error (e.g. challenge succeeded, vault defaulted). No further transitions.</p>
+        <p><span className="text-white font-medium">REORGED</span> — a chain reorg retracted the source event. Strait rolls back the transfer. A duplicate may re-appear if the tx is re-included.</p>
+        <p className="pt-1">A robust integration treats <Code>FINALIZED</Code> as &quot;done&quot; and polls on any other non-terminal status.</p>
+      </div>
     </Section>
   );
 }
@@ -198,7 +298,7 @@ function UsingTheApi() {
         <Code>/graphql</Code> in a browser for the interactive GraphiQL playground.
       </p>
 
-      <h3 className="text-lg font-semibold text-white pt-2">Endpoints</h3>
+      <h3 id="api-endpoints" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Endpoints</h3>
       <div className="overflow-hidden rounded-xl border border-white/[0.07]">
         <table className="w-full text-sm">
           <tbody>
@@ -218,7 +318,7 @@ function UsingTheApi() {
         </table>
       </div>
 
-      <h3 className="text-lg font-semibold text-white pt-2">GraphQL queries</h3>
+      <h3 id="api-graphql" className="text-lg font-semibold text-white pt-2 scroll-mt-24">GraphQL queries</h3>
       <Pre>{`# Recent transfers (newest first; limit clamped 1–500, default 50)
 { transfers(limit: 20) { id route asset amount status initiatedAt finalizedAt } }
 
@@ -235,7 +335,7 @@ function UsingTheApi() {
 # Aggregate stats
 { stats { totalTransfers } }`}</Pre>
 
-      <h3 className="text-lg font-semibold text-white pt-2">Examples</h3>
+      <h3 id="api-examples" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Examples</h3>
       <Pre>{`// TypeScript — search via GraphQL
 const res = await fetch("http://localhost:8080/graphql", {
   method: "POST",
@@ -252,8 +352,13 @@ curl 'http://localhost:8080/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'`}</P
 
       <Callout>
         <strong>Polling for finality:</strong> there&apos;s no subscription/webhook endpoint
-        yet — poll <Code>transfersByRecipient</Code> every ~10–15s and stop when{" "}
-        <Code>status === &quot;FINALIZED&quot;</Code>.
+        yet — poll. If you know your source tx hash (you always do — you just submitted
+        it), use <Code>searchTransfers(query: &quot;0xyourtxhash&quot;)</Code> every
+        ~10–15s rather than matching by amount/route/time — it finds your transfer
+        directly instead of guessing. Fall back to <Code>transfersByRecipient</Code> only
+        if you don&apos;t have a tx hash yet. Stop when{" "}
+        <Code>status === &quot;FINALIZED&quot;</Code> (or <Code>FAILED</Code> /{" "}
+        <Code>REORGED</Code>).
       </Callout>
     </Section>
   );
@@ -268,6 +373,7 @@ function Contracts() {
     ["L1StandardBridgeProxy", "Ethereum Sepolia", "0xc94b1BEe63A3e101FE5F71C80F912b4F4b055925"],
     ["BitcoinKitV1", "Hemi Mainnet", "0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12"],
     ["BitcoinKit v0", "Hemi Sepolia", "0xeC9fa5daC1118963933e1A675a4EEA0009b7f215"],
+    ["PoPPayoutsV2", "Hemi Mainnet", "0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b"],
     ["PoPPayoutsV2", "Hemi Sepolia", "0x4a3b61C586DB4CD219E85aC0697b66916c7457AB"],
   ];
   return (
@@ -297,30 +403,15 @@ function Contracts() {
           </tbody>
         </table>
       </div>
-    </Section>
-  );
-}
-
-function SelfHost() {
-  return (
-    <Section id="self-host" title="Run your own node">
-      <p>
-        Strait is open source and self-hostable. State lives in Postgres/Supabase, so the node
-        is a stateless worker that resumes from its checkpoint on restart.
-      </p>
-      <Pre>{`git clone https://github.com/Godbrand0/strait
-cd strait && cp .env.example .env
-
-# Set HEMI_RPC_URL, ETH_RPC_URL, the contract addresses,
-# DATABASE_URL, and start blocks in .env, then:
-cargo run -p strait-node
-
-# GraphQL:    http://localhost:8080/graphql
-# Playground: open the same URL in a browser`}</Pre>
-      <p className="text-zinc-400">
-        For testnet, use <Code>.env.testnet.example</Code> (Hemi Sepolia + Ethereum Sepolia)
-        and a separate database.
-      </p>
+      <Callout>
+        <strong>PoP anchoring status (June 2026):</strong> The <Code>PoPPayoutsV2</Code>{" "}
+        contracts are deployed on mainnet but <Code>mintPoPRewards()</Code> has not yet been
+        called — <Code>lastBlockRewarded = 0</Code> on both deployments.{" "}
+        <Code>BTC_TO_HEMI</Code> deposits already reach <Code>FINALIZED</Code> at the Hemi
+        mint — PoP anchoring is tracked separately via <Code>popAnchored</Code>. Strait will
+        set <Code>popAnchored=true</Code> automatically once{" "}
+        <Code>PayoutRoundExecuted</Code> events start firing.
+      </Callout>
     </Section>
   );
 }

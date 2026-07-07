@@ -163,6 +163,17 @@ pub enum HemiEvent {
         block_number: u64,
         log_index: u32,
     },
+    /// Emitted when a HEMI_TO_BTC withdrawal challenge succeeds — the operator
+    /// failed to pay within the deadline and the user's hBTC was re-minted.
+    /// The withdrawal is considered failed/refunded.
+    WithdrawalChallengeSuccess {
+        uuid: u64,
+        withdrawer: Address,
+        tx_hash: TxHash,
+        block_number: u64,
+        block_time: DateTime<Utc>,
+        log_index: u32,
+    },
     /// A chain reorganization was detected
     BlockReorg {
         old_tip: BlockHash,
@@ -200,6 +211,20 @@ pub enum EthereumEvent {
         log_index: u32,
         /// Gas spent on this L1 tx (wei = gasUsed * effectiveGasPrice), if fetched.
         gas_fee: Option<BigDecimal>,
+    },
+    /// Emitted when `proveWithdrawalTransaction` is called on OptimismPortal.
+    ///
+    /// Signals that the 1-day OP Stack challenge window has started for a
+    /// HEMI_TO_ETH withdrawal. The transfer advances INITIATED → PROVING.
+    /// `withdrawal_hash` is the bytes32 identifier from the event (not a tx hash).
+    WithdrawalProven {
+        withdrawal_hash: TxHash,
+        from: Address,
+        to: Address,
+        tx_hash: TxHash,
+        block_number: u64,
+        block_time: DateTime<Utc>,
+        log_index: u32,
     },
     /// A chain reorganization was detected
     BlockReorg {

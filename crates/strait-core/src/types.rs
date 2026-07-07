@@ -271,6 +271,10 @@ pub enum TunnelStatus {
     Initiated,
     /// PoP proof observed for BTC routes; relay observed for ETH routes
     Anchored,
+    /// OP Stack withdrawal proven on L1 — 1-day challenge window is now open.
+    /// Applies to HEMI_TO_ETH routes only; advances to FINALIZED once the
+    /// challenge period elapses and `finalizeWithdrawalTransaction` is called.
+    Proving,
     Finalized,
     Failed {
         reason: String,
@@ -285,6 +289,7 @@ impl fmt::Display for TunnelStatus {
         match self {
             Self::Initiated => write!(f, "INITIATED"),
             Self::Anchored => write!(f, "ANCHORED"),
+            Self::Proving => write!(f, "PROVING"),
             Self::Finalized => write!(f, "FINALIZED"),
             Self::Failed { reason } => write!(f, "FAILED: {}", reason),
             Self::Reorged { retracted_at } => write!(f, "REORGED at {}", retracted_at),

@@ -110,6 +110,49 @@ impl ReorgDetector {
         }
     }
 
+    /// Check the newest recorded block against the canonical chain and, if it
+    /// no longer matches, walk backwards to find the first affected height.
+    ///
+    /// Returns `Ok(None)` when the newest recorded hash still matches (the
+    /// common case — one extra RPC call per poll). On a mismatch, returns
+    /// `Ok(Some(h))` where `h` is the lowest recorded height whose hash
+    /// diverges from the canonical chain: every block >= h must be re-scanned.
+    pub async fn find_reorg_point<P: Provider + ?Sized>(
+        &self,
+        provider: &P,
+    ) -> Result<Option<u64>> {
+        // Fast path: newest recorded block still canonical → no reorg.
+        let Some((newest, newest_hash)) = self
+            .block_hashes
+            .iter()
+            .rev()
+            .find(|(_, h)| !h.is_empty())
+        else {
+            return Ok(None); // nothing recorded yet
+        };
+        if self.get_block_hash(provider, *newest).await? == *newest_hash {
+            return Ok(None);
+        }
+
+        // The tip diverged. Walk backwards to the newest block that still
+        // matches. Only per-window checkpoints are recorded, so the true fork
+        // point may lie between two recorded heights — everything above the
+        // newest *matching* block must be treated as affected.
+        let mut oldest_recorded = *newest;
+        for (height, recorded_hash) in self.block_hashes.iter().rev().skip(1) {
+            if recorded_hash.is_empty() {
+                continue;
+            }
+            if self.get_block_hash(provider, *height).await? == *recorded_hash {
+                return Ok(Some(*height + 1));
+            }
+            oldest_recorded = *height;
+        }
+        // Every recorded block mismatched — the reorg is at least as deep as
+        // our window; re-scan from the oldest block we know about.
+        Ok(Some(oldest_recorded))
+    }
+
     /// Detect reorg by checking multiple recent blocks.
     ///
     /// More thorough than single-block detection. Checks all recorded

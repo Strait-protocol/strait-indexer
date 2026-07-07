@@ -66,7 +66,16 @@ export type Transfer = {
   finalizedAt: string | null;
 };
 
-export type Stats = { totalTransfers: number };
+export type Stats = {
+  totalTransfers: number;
+  initiated: number;
+  anchored: number;
+  proving: number;
+  finalized: number;
+  failed: number;
+  reorged: number;
+  popAnchored: number;
+};
 
 const TRANSFER_FIELDS = `
   id asset direction route amount sender recipient status
@@ -90,6 +99,7 @@ export async function graphql<T>(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query, variables }),
       cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -104,18 +114,28 @@ export async function graphql<T>(
   }
 }
 
-export async function getOverview(network: Network = DEFAULT_NETWORK): Promise<{
+export const PAGE_SIZE = 20;
+
+export async function getOverview(
+  network: Network = DEFAULT_NETWORK,
+  page: number = 1,
+): Promise<{
   stats: Stats;
   transfers: Transfer[];
+  hasNextPage: boolean;
 } | null> {
-  return graphql(
+  const offset = (page - 1) * PAGE_SIZE;
+  const data = await graphql<{ stats: Stats; transfers: Transfer[] }>(
     `{
-    stats { totalTransfers }
-    transfers(limit: 50) { ${TRANSFER_FIELDS} }
-  }`,
+      stats { totalTransfers initiated anchored proving finalized failed reorged popAnchored }
+      transfers(limit: ${PAGE_SIZE + 1}, offset: ${offset}) { ${TRANSFER_FIELDS} }
+    }`,
     undefined,
     network,
   );
+  if (!data) return null;
+  const hasNextPage = data.transfers.length > PAGE_SIZE;
+  return { stats: data.stats, transfers: data.transfers.slice(0, PAGE_SIZE), hasNextPage };
 }
 
 export async function getTransfer(
@@ -133,21 +153,31 @@ export async function getTransfer(
 /** Search transfers by id / address / tx hash, with optional status & route filters. */
 export async function searchTransfers(
   network: Network,
-  opts: { query?: string; status?: string; route?: string },
-): Promise<Transfer[]> {
+  opts: { query?: string; status?: string; route?: string; page?: number },
+): Promise<{ transfers: Transfer[]; hasNextPage: boolean }> {
+  const page = opts.page ?? 1;
+  const offset = (page - 1) * PAGE_SIZE;
   const data = await graphql<{ searchTransfers: Transfer[] }>(
-    `query($q: String, $s: String, $r: String) {
-       searchTransfers(query: $q, status: $s, route: $r, limit: 100) { ${TRANSFER_FIELDS} }
+    `query($q: String, $s: String, $r: String, $l: Int, $o: Int) {
+       searchTransfers(query: $q, status: $s, route: $r, limit: $l, offset: $o) { ${TRANSFER_FIELDS} }
      }`,
-    { q: opts.query || null, s: opts.status || null, r: opts.route || null },
+    {
+      q: opts.query || null,
+      s: opts.status || null,
+      r: opts.route || null,
+      l: PAGE_SIZE + 1,
+      o: offset,
+    },
     network,
   );
-  return data?.searchTransfers ?? [];
+  const rows = data?.searchTransfers ?? [];
+  const hasNextPage = rows.length > PAGE_SIZE;
+  return { transfers: rows.slice(0, PAGE_SIZE), hasNextPage };
 }
 
 // ── View helpers ─────────────────────────────────────────────────────────────
 
-export const STATUSES = ["INITIATED", "ANCHORED", "FINALIZED", "FAILED", "REORGED"] as const;
+export const STATUSES = ["INITIATED", "PROVING", "ANCHORED", "FINALIZED", "FAILED", "REORGED"] as const;
 
 export function statusStyle(status: string): { dot: string; text: string; label: string } {
   switch (status) {
@@ -155,6 +185,8 @@ export function statusStyle(status: string): { dot: string; text: string; label:
       return { dot: "bg-emerald-400", text: "text-emerald-300", label: "Finalized" };
     case "ANCHORED":
       return { dot: "bg-orange-400", text: "text-orange-300", label: "Anchored" };
+    case "PROVING":
+      return { dot: "bg-sky-400", text: "text-sky-300", label: "Proving" };
     case "INITIATED":
       return { dot: "bg-zinc-400", text: "text-zinc-300", label: "Initiated" };
     case "FAILED":

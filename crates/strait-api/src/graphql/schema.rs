@@ -87,8 +87,22 @@ impl From<TunnelTransferRow> for Transfer {
 /// Aggregate indexer statistics.
 #[derive(SimpleObject)]
 pub struct Stats {
-    /// Total number of indexed transfers.
+    /// Total number of indexed transfers (all time).
     pub total_transfers: i64,
+    /// Transfers currently in INITIATED state.
+    pub initiated: i64,
+    /// Transfers currently in ANCHORED state (BTC routes, PoP-anchored).
+    pub anchored: i64,
+    /// HEMI_TO_ETH withdrawals with their withdrawal proven — 1-day challenge window open.
+    pub proving: i64,
+    /// Transfers that reached FINALIZED state.
+    pub finalized: i64,
+    /// Transfers in a terminal FAILED state.
+    pub failed: i64,
+    /// Transfers rolled back due to a reorg.
+    pub reorged: i64,
+    /// Transfers that have been PoP-anchored to Bitcoin (across all statuses).
+    pub pop_anchored: i64,
 }
 
 pub struct Query;
@@ -169,8 +183,22 @@ impl Query {
     async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<Stats> {
         let db = db(ctx)?;
         let repo = TunnelTransferRepo::new(db);
+        let (total, by_status, pop) = tokio::try_join!(
+            repo.count(),
+            repo.count_by_status(),
+            repo.count_pop_anchored(),
+        )
+        .map_err(to_gql)?;
+        let n = |s: &str| *by_status.get(s).unwrap_or(&0);
         Ok(Stats {
-            total_transfers: repo.count().await.map_err(to_gql)?,
+            total_transfers: total,
+            initiated: n("INITIATED"),
+            anchored: n("ANCHORED"),
+            proving: n("PROVING"),
+            finalized: n("FINALIZED"),
+            failed: n("FAILED"),
+            reorged: n("REORGED"),
+            pop_anchored: pop,
         })
     }
 }

@@ -10,7 +10,10 @@
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use strait_core::{
-    config::{BTC_DEPOSIT_MATCH_WINDOW_SECS, ETH_DEPOSIT_MATCH_WINDOW_SECS},
+    config::{
+        BTC_DEPOSIT_MATCH_WINDOW_SECS, ETH_DEPOSIT_MATCH_WINDOW_SECS,
+        ETH_WITHDRAWAL_PROOF_WINDOW_SECS,
+    },
     events::{BitcoinEvent, EthereumEvent, HemiEvent, RawEvent},
     types::BitcoinTxid,
 };
@@ -78,6 +81,9 @@ pub struct EventMatcher {
     pending_hemi_mints_by_txid: HashMap<BitcoinTxid, Vec<PendingEvent>>,
     pending_hemi_mints_by_addr: HashMap<MatchKey, Vec<PendingEvent>>,
     pending_hemi_burns: HashMap<MatchKey, Vec<PendingEvent>>,
+    /// Latest on-chain event timestamp observed — the clock used for pruning,
+    /// so pruning works during historical backfill as well as live tailing.
+    latest_seen: Option<DateTime<Utc>>,
 }
 
 impl EventMatcher {
@@ -89,17 +95,50 @@ impl EventMatcher {
             pending_hemi_mints_by_txid: HashMap::new(),
             pending_hemi_mints_by_addr: HashMap::new(),
             pending_hemi_burns: HashMap::new(),
+            latest_seen: None,
         }
     }
 
     /// Process a raw event and return a MatchResult if one is found.
     pub fn process_event(&mut self, event: RawEvent) -> Option<MatchResult> {
+        // Advance the pruning clock and expire pending events that can no longer
+        // match anything — without this the pending maps grow without bound.
+        if let Some(t) = event_block_time(&event) {
+            let now = self.latest_seen.map_or(t, |seen| seen.max(t));
+            self.latest_seen = Some(now);
+            self.prune_stale(now);
+        }
+
         // Clone so we can destructure for matching while still owning the original.
         match event.clone() {
             RawEvent::Bitcoin(btc) => self.process_btc_event(event, &btc),
             RawEvent::Hemi(hemi)   => self.process_hemi_event(event, &hemi),
             RawEvent::Ethereum(eth) => self.process_eth_event(event, &eth),
         }
+    }
+
+    /// Drop pending events older than their route's match window (with 2x margin;
+    /// burns wait out the OP Stack proof window). Expired entries could never
+    /// match again — the time-window check would reject them anyway.
+    fn prune_stale(&mut self, now: DateTime<Utc>) {
+        fn prune(map: &mut HashMap<MatchKey, Vec<PendingEvent>>, now: DateTime<Utc>, max_age: i64) {
+            map.retain(|_, v| {
+                v.retain(|e| (now - e.timestamp).num_seconds() <= max_age);
+                !v.is_empty()
+            });
+        }
+        let btc_age = self.config.btc_deposit_match_window_secs * 2;
+        let eth_age = self.config.eth_deposit_match_window_secs * 2;
+        // Burns pair with an L1 release that lands after the ~1-day challenge window.
+        let burn_age = ETH_WITHDRAWAL_PROOF_WINDOW_SECS * 2;
+        prune(&mut self.pending_btc_deposits, now, btc_age);
+        prune(&mut self.pending_eth_locks, now, eth_age);
+        prune(&mut self.pending_hemi_mints_by_addr, now, eth_age);
+        prune(&mut self.pending_hemi_burns, now, burn_age);
+        self.pending_hemi_mints_by_txid.retain(|_, v| {
+            v.retain(|e| (now - e.timestamp).num_seconds() <= btc_age);
+            !v.is_empty()
+        });
     }
 
     fn process_btc_event(&mut self, event: RawEvent, btc: &BitcoinEvent) -> Option<MatchResult> {
@@ -162,7 +201,7 @@ impl EventMatcher {
 
     fn process_hemi_event(&mut self, event: RawEvent, hemi: &HemiEvent) -> Option<MatchResult> {
         match hemi {
-            HemiEvent::TunnelMint { source_txid, to, asset, amount, .. } => {
+            HemiEvent::TunnelMint { source_txid, to, asset, amount, block_time, .. } => {
                 let amount_f64 = amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let addr_str   = hex::encode(to.0);
                 let asset_str  = format!("{:?}", asset);
@@ -173,7 +212,9 @@ impl EventMatcher {
                     address: addr_str.clone(),
                     asset: asset_str.clone(),
                     amount: amount_f64,
-                    timestamp: Utc::now(),
+                    // On-chain block time, not ingestion time — keeps the time-window
+                    // check meaningful during historical backfill.
+                    timestamp: *block_time,
                     source_txid: source_txid.clone(),
                 };
 
@@ -231,41 +272,25 @@ impl EventMatcher {
                 None
             }
 
-            // Hemi → ETH: TunnelBurn waiting for EthereumEvent::TunnelRelease
-            HemiEvent::TunnelBurn { from, asset, amount, .. } => {
+            // Hemi → ETH: TunnelBurn waits for a later EthereumEvent::TunnelRelease.
+            // A burn is always the *first* leg of a withdrawal (the L1 release
+            // follows the OP Stack challenge window), so there is nothing to match
+            // against yet — never pair a burn with a pending TunnelLock (an L1
+            // *deposit*), which would corrupt the withdrawal's source leg.
+            HemiEvent::TunnelBurn { from, asset, amount, block_time, .. } => {
                 let amount_f64 = amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let addr_str   = hex::encode(from.0);
                 let asset_str  = format!("{:?}", asset);
                 let key = MatchKey { address: addr_str.clone(), asset: asset_str.clone() };
-                let tolerance  = self.config.amount_tolerance;
 
-                let pending = PendingEvent {
+                self.pending_hemi_burns.entry(key).or_default().push(PendingEvent {
                     raw: event,
                     address: addr_str,
                     asset: asset_str,
                     amount: amount_f64,
-                    timestamp: Utc::now(),
+                    timestamp: *block_time,
                     source_txid: None,
-                };
-
-                // Try to match against a pending ETH release
-                if let Some(releases) = self.pending_eth_locks.get_mut(&key) {
-                    if let Some(pos) = releases.iter().position(|r| {
-                        amounts_match(r.amount, amount_f64, tolerance)
-                    }) {
-                        let rel = releases.remove(pos);
-                        if releases.is_empty() { self.pending_eth_locks.remove(&key); }
-                        return Some(MatchResult {
-                            source: pending.raw,
-                            destination: rel.raw,
-                            direction: MatchDirection::HemiToEth,
-                            amount: amount_f64,
-                            address: pending.address,
-                        });
-                    }
-                }
-
-                self.pending_hemi_burns.entry(key).or_default().push(pending);
+                });
                 None
             }
 
@@ -275,7 +300,7 @@ impl EventMatcher {
 
     fn process_eth_event(&mut self, event: RawEvent, eth: &EthereumEvent) -> Option<MatchResult> {
         match eth {
-            EthereumEvent::TunnelLock { from, asset, amount, .. } => {
+            EthereumEvent::TunnelLock { from, asset, amount, block_time, .. } => {
                 let amount_f64 = amount.to_string().parse::<f64>().unwrap_or(0.0);
                 let addr_str   = hex::encode(from.0);
                 let asset_str  = format!("{:?}", asset);
@@ -288,7 +313,7 @@ impl EventMatcher {
                     address: addr_str,
                     asset: asset_str,
                     amount: amount_f64,
-                    timestamp: Utc::now(),
+                    timestamp: *block_time,
                     source_txid: None,
                 };
 
@@ -380,6 +405,23 @@ impl PendingCount {
 
 // ── Free helpers (avoid borrow conflicts inside closures) ─────────────────────
 
+/// The on-chain block timestamp carried by a raw event, if it has one.
+fn event_block_time(event: &RawEvent) -> Option<DateTime<Utc>> {
+    match event {
+        RawEvent::Bitcoin(BitcoinEvent::TunnelDeposit { block_time, .. })
+        | RawEvent::Bitcoin(BitcoinEvent::TunnelWithdrawal { block_time, .. })
+        | RawEvent::Hemi(HemiEvent::TunnelMint { block_time, .. })
+        | RawEvent::Hemi(HemiEvent::TunnelBurn { block_time, .. })
+        | RawEvent::Hemi(HemiEvent::WithdrawalChallengeSuccess { block_time, .. })
+        | RawEvent::Ethereum(EthereumEvent::TunnelLock { block_time, .. })
+        | RawEvent::Ethereum(EthereumEvent::TunnelRelease { block_time, .. })
+        | RawEvent::Ethereum(EthereumEvent::WithdrawalProven { block_time, .. }) => {
+            Some(*block_time)
+        }
+        _ => None,
+    }
+}
+
 fn amounts_match(a: f64, b: f64, tolerance: f64) -> bool {
     if a == 0.0 || b == 0.0 { return false; }
     (a - b).abs() <= a.max(b) * tolerance
@@ -393,7 +435,6 @@ fn within_time_window(a: DateTime<Utc>, b: DateTime<Utc>, max_gap_secs: i64) -> 
 mod tests {
     use super::*;
     use bigdecimal::BigDecimal;
-    use std::str::FromStr;
     use chrono::Utc;
     use strait_core::{
         events::BitcoinEvent,
@@ -485,5 +526,72 @@ mod tests {
         assert!(matcher.process_event(make_btc_deposit([5u8; 32], "bc1qtest", 100_000_000)).is_none());
         assert_eq!(matcher.pending_count().btc_deposits, 1);
         assert_eq!(matcher.pending_count().total(), 1);
+    }
+
+    /// Regression: a Hemi burn (withdrawal) must never pair with a pending L1
+    /// TunnelLock (a deposit) from the same address with a similar amount — the
+    /// release that pairs with a burn always arrives *after* the burn.
+    #[test]
+    fn test_burn_does_not_match_pending_lock() {
+        let mut matcher = EventMatcher::new(MatcherConfig::default());
+        let addr = Address([0x42u8; 20]);
+        let amount = BigDecimal::from(1_000_000_000_000_000_000u64); // 1 ETH
+
+        // Same user deposits 1 ETH on L1...
+        let lock = RawEvent::Ethereum(EthereumEvent::TunnelLock {
+            tx_hash: TxHash([1u8; 32]),
+            asset: Asset::Eth,
+            amount: amount.clone(),
+            from: addr,
+            block_number: 100,
+            block_time: Utc::now(),
+            log_index: 0,
+            gas_fee: None,
+        });
+        assert!(matcher.process_event(lock).is_none());
+
+        // ...then burns 1 ETH on Hemi to withdraw. This must NOT match the lock.
+        let burn = RawEvent::Hemi(HemiEvent::TunnelBurn {
+            tx_hash: TxHash([2u8; 32]),
+            asset: Asset::Eth,
+            amount,
+            from: addr,
+            destination: strait_core::types::ChainAddress::Evm(addr),
+            block_number: 200,
+            block_time: Utc::now(),
+            log_index: 0,
+            gas_fee: None,
+            uuid: None,
+        });
+        assert!(matcher.process_event(burn).is_none());
+        // Both stay pending, awaiting their real counterparts.
+        assert_eq!(matcher.pending_count().eth_locks, 1);
+        assert_eq!(matcher.pending_count().hemi_burns, 1);
+    }
+
+    /// Pending events past their match window are pruned as newer events arrive,
+    /// so the pending maps cannot grow without bound.
+    #[test]
+    fn test_stale_pending_events_are_pruned() {
+        let mut matcher = EventMatcher::new(MatcherConfig::default());
+
+        // A deposit whose block time is far in the past.
+        let old = RawEvent::Bitcoin(BitcoinEvent::TunnelDeposit {
+            txid: BitcoinTxid([6u8; 32]),
+            vout: 0,
+            to_address: BitcoinAddress::new("bc1qold"),
+            amount_sats: 100_000_000,
+            op_return_data: None,
+            hemi_destination: None,
+            block_number: 100,
+            block_hash: BlockHash([0; 32]),
+            block_time: Utc::now() - chrono::Duration::seconds(BTC_DEPOSIT_MATCH_WINDOW_SECS * 3),
+        });
+        assert!(matcher.process_event(old).is_none());
+        assert_eq!(matcher.pending_count().btc_deposits, 1);
+
+        // A fresh deposit advances the pruning clock past the old one's window.
+        assert!(matcher.process_event(make_btc_deposit([7u8; 32], "bc1qnew", 200_000_000)).is_none());
+        assert_eq!(matcher.pending_count().btc_deposits, 1, "stale deposit should be pruned");
     }
 }

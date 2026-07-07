@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::B256;
 use alloy::providers::Provider;
@@ -123,24 +124,19 @@ impl BitcoinKitCaller {
 
     /// Read the OP_RETURN payload from a Bitcoin transaction by txid.
     ///
-    /// Uses `getTransactionOutputsByTxId` (precompile 0x??) which fetches only
-    /// the outputs — more efficient than `getTransactionByTxId` when inputs are
-    /// not needed. Iterates outputs looking for `isOpReturn == true` and returns
-    /// the raw `opReturnData` bytes from the first match.
-    ///
-    /// Returns `None` if the transaction has no OP_RETURN output.
+    /// Uses `getTransactionByTxId` and scans its outputs for `isOpReturn == true`
+    /// OR a script starting with `0x6a` (the OP_RETURN opcode). The script-prefix
+    /// fallback guards against BitcoinKit bugs where `isOpReturn` is not set even
+    /// though the output is genuinely OP_RETURN (observed in vault sweep txs on mainnet).
     pub async fn get_op_return_data(&self, txid: &BitcoinTxid) -> Result<Option<Vec<u8>>> {
-        let call = IBitcoinKitV1::getTransactionOutputsByTxIdCall { txId: B256::from(txid.0) };
+        let call = IBitcoinKitV1::getTransactionByTxIdCall { txId: B256::from(txid.0) };
         let result = self.call(call.abi_encode()).await?;
-        let decoded = IBitcoinKitV1::getTransactionOutputsByTxIdCall::abi_decode_returns(
-            &result, false,
-        )
-        .map_err(|e| StraitError::Parse(format!("getTransactionOutputsByTxId decode: {e}")))?;
+        let tx = IBitcoinKitV1::getTransactionByTxIdCall::abi_decode_returns(&result, false)
+            .map_err(|e| StraitError::Parse(format!("getTransactionByTxId decode: {e}")))?
+            ._0;
 
-        // Pass output.script (the full OP_RETURN script including 0x6a prefix) to
-        // parse_hemi_destination — the vault parses the script, not opReturnData.
-        for output in decoded._0 {
-            if output.isOpReturn {
+        for output in tx.outputs {
+            if output.isOpReturn || output.script.first() == Some(&0x6a) {
                 return Ok(Some(output.script.to_vec()));
             }
         }
@@ -247,6 +243,8 @@ pub struct CustodyWatcher {
     addresses: HashSet<String>,
     /// Txids already processed — prevents re-emitting on subsequent polls.
     seen: HashSet<[u8; 32]>,
+    /// False until the first poll has seeded `seen` with pre-existing UTXOs.
+    initialized: bool,
 }
 
 impl CustodyWatcher {
@@ -255,17 +253,68 @@ impl CustodyWatcher {
             caller,
             addresses: addresses.into_iter().collect(),
             seen: HashSet::new(),
+            initialized: false,
         }
+    }
+
+    /// On the very first call, enumerate all currently-unspent UTXOs across every
+    /// watched address and mark them seen without processing them. These are
+    /// pre-existing deposits already captured by the Hemi EVM ingester via
+    /// DepositConfirmed. Marking them seen upfront avoids a burst of
+    /// getTransactionByTxId calls on startup that would saturate the rate limit.
+    ///
+    /// Returns true only if ALL addresses were successfully seeded. On partial
+    /// failure (any 429/error), returns false so the next poll retries the init
+    /// rather than treating unseeded addresses' UTXOs as new deposits.
+    async fn initialize_seen(&mut self) -> bool {
+        let mut all_ok = true;
+        let mut total = 0usize;
+        for addr in &self.addresses.clone() {
+            // Pace seed calls: 400ms gap = 2.5 calls/sec, well under the 300 req/min
+            // (5 req/s) public Hemi RPC limit even when the EVM ingester fires concurrently.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let utxos = match self.caller.get_utxos_for_address(addr).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(address = %addr, error = %e, "Seed-seen UTXO fetch failed — will retry on next poll");
+                    all_ok = false;
+                    continue;
+                }
+            };
+            for utxo in &utxos {
+                self.seen.insert(utxo.txId.into());
+            }
+            total += utxos.len();
+        }
+        if all_ok {
+            info!(utxos_skipped = total, "Custody watcher initialized — pre-existing UTXOs marked seen, watching for new deposits only");
+            self.initialized = true;
+        } else {
+            warn!(seeded_so_far = total, "Seed-seen incomplete — retrying failed addresses on next poll");
+        }
+        all_ok
     }
 
     /// Poll all watched addresses and return any new UTXOs not yet seen.
     pub async fn poll_new_deposits(&mut self) -> Result<Vec<DepositCandidate>> {
+        if !self.initialized {
+            // Run seed-seen and always return early this cycle — success or not.
+            // On success, the 60s poll sleep separates seed-seen from the first
+            // real poll, preventing a 14-call burst (7 seed + 7 poll back-to-back)
+            // that trips the 300 req/min rate limit. On failure, we retry next cycle.
+            self.initialize_seen().await;
+            return Ok(Vec::new());
+        }
+
         let mut candidates = Vec::new();
 
         // Bitcoin tip height (best-effort) so we can derive each deposit's block.
         let tip_height = self.caller.get_tip_height().await.unwrap_or(0);
 
         for addr in &self.addresses.clone() {
+            // Pace the 7 UTXO-list calls to avoid a burst that overlaps with the
+            // Hemi EVM ingester and exceeds the 300 req/min rolling rate limit.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             // One bad/invalid custody address must not fail the whole poll —
             // log it and move on to the others.
             let utxos = match self.caller.get_utxos_for_address(addr).await {
@@ -284,9 +333,27 @@ impl CustodyWatcher {
                     continue;
                 }
 
-                // Fetch OP_RETURN data to extract the Hemi destination
+                // Pace per-UTXO API calls to stay within the public Hemi RPC rate limit
+                // (300 req/min). Without this, a custody address with many existing UTXOs
+                // fires a burst of getTransactionByTxId calls on every poll, saturating
+                // the limit and causing 429s for the other watchers.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                // Fetch OP_RETURN data to extract the Hemi destination.
+                // On any error (including 429) mark as seen to prevent re-bursting on
+                // the next poll. This skip is permanent for the txid (a restart
+                // seeds all existing UTXOs as seen), but the transfer itself is
+                // still captured via the Hemi DepositConfirmed event — only the
+                // Bitcoin-side leg data (real BTC block, gross amount) is lost.
                 let bitcoin_txid = BitcoinTxid(txid);
-                let op_return = self.caller.get_op_return_data(&bitcoin_txid).await?;
+                let op_return = match self.caller.get_op_return_data(&bitcoin_txid).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(txid = %hex::encode(txid), error = %e, "OP_RETURN fetch failed — skipping UTXO");
+                        self.seen.insert(txid);
+                        continue;
+                    }
+                };
 
                 let hemi_destination = op_return.as_deref().and_then(parse_hemi_destination);
 
@@ -299,7 +366,14 @@ impl CustodyWatcher {
                     continue;
                 }
 
-                let confirmations = self.caller.get_confirmations(&bitcoin_txid).await?;
+                let confirmations = match self.caller.get_confirmations(&bitcoin_txid).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(txid = %hex::encode(txid), error = %e, "Confirmation fetch failed — skipping UTXO");
+                        self.seen.insert(txid);
+                        continue;
+                    }
+                };
 
                 // Block height of the deposit tx ≈ tip - (confirmations - 1).
                 let block_height = if confirmations > 0 {

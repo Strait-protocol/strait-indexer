@@ -36,13 +36,13 @@ to Postgres/Supabase, and serves them over REST + GraphQL with a web dashboard o
 |---|---|
 | Hemi + Ethereum EVM ingesters (live, reorg-aware) | ✅ Built |
 | Join engine — `TunnelTransfer` lifecycle, PoP anchoring | ✅ Built |
-| Bitcoin custody watcher (BitcoinKit, OP_RETURN decode) | ✅ Built (opt-in via custody addresses) |
+| Bitcoin custody watcher (BitcoinKit, OP_RETURN decode) | ✅ Built — all 9 mainnet vault custody addresses configured |
 | Postgres/Supabase persistence + auto-migrations | ✅ Built |
 | Checkpointing / resumability / historical backfill | ✅ Built |
 | REST (`/transfers`) + GraphQL (`/graphql`) API | ✅ Built |
 | Web dashboard (Next.js tunnel explorer + finality timeline) | ✅ Built |
 | Webhooks (push notifications) | 🚧 Planned |
-| Vault auto-discovery for the BTC watch-set | 🚧 Planned |
+| Vault auto-discovery for the BTC watch-set | ✅ Vault addresses discovered and configured (9 vaults, June 2026) |
 
 The GraphQL schema and setup steps documented below reflect what is **actually
 implemented**. Sections marked _Planned_ are design targets, not yet shipped.
@@ -74,6 +74,14 @@ All addresses confirmed from the Hemi explorer and the [`hemilabs/bitcoin-tunnel
 |---|---|---|
 | Hemi Mainnet | `0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12` | v1 |
 | Hemi Sepolia | `0xeC9fa5daC1118963933e1A675a4EEA0009b7f215` | v0 |
+
+### PoP Anchoring — `PoPPayoutsV2`
+
+| Network | Address |
+|---|---|
+| Hemi Mainnet (canonical) | `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` |
+| Hemi Mainnet (first deployment) | `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40` |
+| Hemi Sepolia (testnet) | `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB` |
 
 ---
 
@@ -183,7 +191,8 @@ Hemi anchors its blocks to Bitcoin through Proof-of-Publication (PoP) miners. St
 | Network | Address |
 |---|---|
 | Hemi Sepolia (testnet) | `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB` |
-| Hemi Mainnet | Confirm from explorer (FIXME) |
+| Hemi Mainnet (canonical) | `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` |
+| Hemi Mainnet (first deployment) | `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40` |
 
 Source: [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts)
 
@@ -419,8 +428,7 @@ DATABASE_URL=postgres://postgres:password@localhost:5432/strait?sslmode=disable
 HEMI_RPC_URL=https://rpc.hemi.network/rpc       # keyless
 ETH_RPC_URL=https://ethereum-rpc.publicnode.com  # keyless (swap in your own for production)
 
-# Leave empty to disable the Bitcoin custody watcher (BTC deposits are still
-# captured via Hemi's DepositConfirmed event). Add real vault custody addresses to enable it.
+# Set to vault custody addresses to enable early deposit detection (see docs/btc-tunnel-guide.md)
 BITCOIN_TUNNEL_ADDRESSES=
 ```
 
@@ -463,6 +471,7 @@ HEMI_CHAIN_ID=43111
 HEMI_TUNNEL_CONTRACT=0x4200000000000000000000000000000000000010
 HEMI_BTC_TUNNEL_CONTRACT=0xEAcA824F46c000fB89403846Bb57e6b913321081
 HEMI_BITCOIN_KIT_CONTRACT=0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12
+HEMI_POP_PAYOUTS_CONTRACT=0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b  # PoPPayoutsV2 mainnet canonical
 ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
 ETH_CHAIN_ID=1
 ETH_TUNNEL_CONTRACT=0x5eaa10F99e7e6D177eF9F74E519E319aa49f191e
@@ -484,13 +493,18 @@ ETH_TUNNEL_CONTRACT=0x5eaa10F99e7e6D177eF9F74E519E319aa49f191e
 | `HEMI_TUNNEL_CONTRACT` | `0x4200...0010` | L2StandardBridge — ETH/ERC-20 routes |
 | `HEMI_BTC_TUNNEL_CONTRACT` | — | BitcoinTunnelManager — BTC routes |
 | `HEMI_BITCOIN_KIT_CONTRACT` | — | BitcoinKit precompile |
+| `HEMI_POP_PAYOUTS_CONTRACT` | — | PoPPayoutsV2 contract; watches PayoutRoundExecuted for BTC→Hemi PoP anchoring |
 | `HEMI_START_BLOCK` | `0` | Block to begin indexing from |
 | `HEMI_CONFIRMATION_DEPTH` | `3` | Blocks before a Hemi event is stable |
+| `HEMI_LOG_RANGE` | `100` | Max block range per eth_getLogs (set to 5 for QuickNode Discover, 10 for Alchemy free) |
+| `HEMI_POLL_INTERVAL_MS` | `1000` | Hemi poll interval in milliseconds (also used as backfill throttle sleep) |
 | `ETH_RPC_URL` | — | Ethereum RPC endpoint |
 | `ETH_CHAIN_ID` | `1` | Chain ID (11155111 for Sepolia) |
 | `ETH_TUNNEL_CONTRACT` | — | L1StandardBridgeProxy on Ethereum |
 | `ETH_START_BLOCK` | `0` | Block to begin indexing from |
 | `ETH_CONFIRMATION_DEPTH` | `12` | Blocks before an Ethereum event is stable |
+| `ETH_LOG_RANGE` | `100` | Max block range per eth_getLogs (set to 10 for Alchemy free tier) |
+| `ETH_POLL_INTERVAL_MS` | `1000` | Ethereum poll interval in milliseconds |
 | `DATABASE_URL` | — | PostgreSQL connection string |
 | `API_HOST` | `0.0.0.0` | API bind address |
 | `API_PORT` | `8080` | API bind port |
@@ -566,8 +580,8 @@ sqlx migrate add <name>   # scaffold a new migration (then edit the .sql)
 | ETH/ERC-20 tunnel ABI | Confirmed — OP Stack `L2StandardBridge` events |
 | BTC tunnel contract address + ABI | Confirmed — `BitcoinTunnelManager` from [`hemilabs/bitcoin-tunnel-contracts`](https://github.com/hemilabs/bitcoin-tunnel-contracts) |
 | OP_RETURN encoding | Confirmed — 22-byte (raw) or 42-byte (ASCII hex) from `SimpleBitcoinVaultUTXOLogicHelper.sol` |
-| PoP proof contract | Confirmed — `PoPPayoutsV2` via keystone anchoring from [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts). Testnet: `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB`. Mainnet address pending. |
-| `PoPPayoutsV2` mainnet address | **Still open** — confirm from Hemi mainnet explorer |
+| PoP proof contract | Confirmed — `PoPPayoutsV2` via keystone anchoring from [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts). Testnet: `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB`. Mainnet: two deployments (see Contract Addresses). |
+| `PoPPayoutsV2` mainnet address | Confirmed — two deployments exist, canonical: `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b`. `mintPoPRewards()` not yet called as of June 2026 — PoP payouts pending Hemi activation. |
 | Reorg frequency in production | **Still open** — ask at Hemi office hour |
 
 ---

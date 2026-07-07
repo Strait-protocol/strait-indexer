@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   getOverview,
@@ -5,7 +6,9 @@ import {
   statusStyle,
   STATUSES,
   isNetwork,
+  PAGE_SIZE,
   type Network,
+  type Stats,
   type Transfer,
 } from "@/lib/strait";
 import TransferRow from "../TransferRow";
@@ -18,7 +21,7 @@ export default async function DashboardPage({
   searchParams,
 }: {
   params: Promise<{ network: string }>;
-  searchParams: Promise<{ q?: string; status?: string; route?: string }>;
+  searchParams: Promise<{ q?: string; status?: string; route?: string; page?: string }>;
 }) {
   const { network: seg } = await params;
   if (!isNetwork(seg)) notFound();
@@ -26,17 +29,29 @@ export default async function DashboardPage({
 
   const sp = await searchParams;
   const filtering = Boolean(sp.q || sp.status || sp.route);
+  const page = Math.max(1, parseInt(sp.page ?? "1", 10) || 1);
 
-  const data = await getOverview(network);
+  const data = await getOverview(network, filtering ? 1 : page);
 
   if (!data) return <OfflineState network={network} />;
 
   const { stats } = data;
-  const transfers = filtering
-    ? await searchTransfers(network, { query: sp.q, status: sp.status, route: sp.route })
-    : data.transfers;
-  const counts = countByStatus(transfers);
-  const anchored = transfers.filter((t) => t.popAnchored).length;
+  let transfers: Transfer[];
+  let hasNextPage: boolean;
+
+  if (filtering) {
+    const result = await searchTransfers(network, {
+      query: sp.q,
+      status: sp.status,
+      route: sp.route,
+      page,
+    });
+    transfers = result.transfers;
+    hasNextPage = result.hasNextPage;
+  } else {
+    transfers = data.transfers;
+    hasNextPage = data.hasNextPage;
+  }
 
   return (
     <div className="space-y-10">
@@ -59,16 +74,16 @@ export default async function DashboardPage({
         </p>
       </div>
 
-      {/* Stat cards */}
+      {/* Stat cards — all sourced from DB stats so the numbers are consistent */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Total transfers" value={stats.totalTransfers.toLocaleString()} />
-        <StatCard label="PoP-anchored (recent)" value={anchored.toString()} accent />
-        <StatCard label="Finalized (recent)" value={(counts.FINALIZED ?? 0).toString()} />
-        <StatCard label="In flight (recent)" value={((counts.INITIATED ?? 0) + (counts.ANCHORED ?? 0)).toString()} />
+        <StatCard label="PoP-anchored" value={stats.popAnchored.toLocaleString()} accent />
+        <StatCard label="Finalized" value={stats.finalized.toLocaleString()} />
+        <StatCard label="In flight" value={(stats.initiated + stats.proving + stats.anchored).toLocaleString()} />
       </div>
 
       {/* Status funnel */}
-      <StatusFunnel counts={counts} total={transfers.length} />
+      <StatusFunnel stats={stats} />
 
       {/* Search + transfers */}
       <section className="space-y-4">
@@ -77,7 +92,11 @@ export default async function DashboardPage({
           <h2 className="text-sm font-medium text-zinc-300">
             {filtering ? "Search results" : "Recent transfers"}
           </h2>
-          <span className="text-xs text-zinc-500">{transfers.length} shown</span>
+          <span className="text-xs text-zinc-500">
+            {transfers.length === 0
+              ? "0 shown"
+              : `${(page - 1) * PAGE_SIZE + 1}–${(page - 1) * PAGE_SIZE + transfers.length}`}
+          </span>
         </div>
 
         {transfers.length === 0 ? (
@@ -90,8 +109,8 @@ export default async function DashboardPage({
                   <th className="font-medium px-4 py-3">Route</th>
                   <th className="font-medium px-4 py-3">Amount</th>
                   <th className="font-medium px-4 py-3">Status</th>
-                  <th className="font-medium px-4 py-3">Bitcoin-final</th>
-                  <th className="font-medium px-4 py-3">Recipient</th>
+                  <th className="font-medium px-4 py-3">From</th>
+                  <th className="font-medium px-4 py-3">To</th>
                   <th className="font-medium px-4 py-3 text-right">Age →</th>
                 </tr>
               </thead>
@@ -101,17 +120,12 @@ export default async function DashboardPage({
                 ))}
               </tbody>
             </table>
+            <Pagination network={network} sp={sp} page={page} hasNextPage={hasNextPage} />
           </div>
         )}
       </section>
     </div>
   );
-}
-
-function countByStatus(transfers: Transfer[]): Record<string, number> {
-  const c: Record<string, number> = {};
-  for (const t of transfers) c[t.status] = (c[t.status] ?? 0) + 1;
-  return c;
 }
 
 function StatCard({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
@@ -125,14 +139,24 @@ function StatCard({ label, value, accent }: { label: string; value: string; acce
   );
 }
 
-function StatusFunnel({ counts, total }: { counts: Record<string, number>; total: number }) {
+function StatusFunnel({ stats }: { stats: Stats }) {
   const colors: Record<string, string> = {
     INITIATED: "bg-zinc-500",
+    PROVING: "bg-sky-400",
     ANCHORED: "bg-orange-400",
     FINALIZED: "bg-emerald-400",
     FAILED: "bg-red-500",
     REORGED: "bg-red-700",
   };
+  const counts: Record<string, number> = {
+    INITIATED: stats.initiated,
+    PROVING: stats.proving,
+    ANCHORED: stats.anchored,
+    FINALIZED: stats.finalized,
+    FAILED: stats.failed,
+    REORGED: stats.reorged,
+  };
+  const total = stats.totalTransfers;
   return (
     <div>
       <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-white/[0.04]">
@@ -170,6 +194,48 @@ function EmptyTransfers({ filtering }: { filtering: boolean }) {
           ? "Try a different address, transaction hash, or id — or clear the filters."
           : "Once the node ingests a tunnel transfer on Hemi, it will appear here in real time."}
       </p>
+    </div>
+  );
+}
+
+function Pagination({
+  network,
+  sp,
+  page,
+  hasNextPage,
+}: {
+  network: Network;
+  sp: { q?: string; status?: string; route?: string };
+  page: number;
+  hasNextPage: boolean;
+}) {
+  function href(p: number) {
+    const params = new URLSearchParams();
+    if (sp.q) params.set("q", sp.q);
+    if (sp.status) params.set("status", sp.status);
+    if (sp.route) params.set("route", sp.route);
+    if (p > 1) params.set("page", String(p));
+    const qs = params.toString();
+    return `/dashboard/${network}${qs ? `?${qs}` : ""}`;
+  }
+  if (page === 1 && !hasNextPage) return null;
+  return (
+    <div className="flex items-center justify-between border-t border-white/[0.06] px-4 py-3">
+      {page > 1 ? (
+        <Link href={href(page - 1)} className="text-xs text-zinc-400 hover:text-white transition-colors">
+          ← Prev
+        </Link>
+      ) : (
+        <span />
+      )}
+      <span className="text-xs text-zinc-600">Page {page}</span>
+      {hasNextPage ? (
+        <Link href={href(page + 1)} className="text-xs text-zinc-400 hover:text-white transition-colors">
+          Next →
+        </Link>
+      ) : (
+        <span />
+      )}
     </div>
   );
 }

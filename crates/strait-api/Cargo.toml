@@ -11,6 +11,7 @@ strait-core = { path = "../strait-core" }
 strait-store = { path = "../strait-store" }
 tokio = { workspace = true }
 axum = { workspace = true }
+tower-http = { workspace = true }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
 serde = { workspace = true }

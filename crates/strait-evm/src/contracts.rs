@@ -231,6 +231,35 @@ sol! {
 }
 
 // ============================================================================
+// OptimismPortal — OP Stack withdrawal proving + finalization
+//
+// Hemi mainnet OptimismPortal:  confirm from Hemi explorer (ETH_OPT_PORTAL_CONTRACT env)
+// Hemi testnet OptimismPortal:  confirm from Sepolia explorer
+//
+// Two-step withdrawal flow:
+//   1. proveWithdrawalTransaction  → emits WithdrawalProven  → 1-day challenge window
+//   2. finalizeWithdrawalTransaction → emits ETHBridgeFinalized on L1StandardBridge
+//
+// Strait watches WithdrawalProven to advance HEMI_TO_ETH withdrawals INITIATED → PROVING.
+// ETHBridgeFinalized (already watched on L1StandardBridge) advances PROVING → FINALIZED.
+// ============================================================================
+
+sol! {
+    interface IOptimismPortal {
+        /// Emitted when proveWithdrawalTransaction is called.
+        /// Starts the 1-day challenge window for the withdrawal.
+        event WithdrawalProven(
+            bytes32 indexed withdrawalHash,
+            address indexed from,
+            address indexed to
+        );
+
+        /// Emitted when finalizeWithdrawalTransaction is called (after the window).
+        event WithdrawalFinalized(bytes32 indexed withdrawalHash, bool success);
+    }
+}
+
+// ============================================================================
 // BitcoinKitV1 precompile interface
 // Confirmed from Hemi mainnet explorer (verified, Solidity 0.8.26).
 // Mainnet:  0x7007dd1C09527B92AEcd8Ae6570B73d09E0B8F12
@@ -244,6 +273,18 @@ sol! {
 //     extract the Hemi destination address encoded in tunnel deposits
 //   - Watch custody addresses for new UTXOs instead of polling Bitcoin RPC
 // ============================================================================
+
+sol! {
+    /// SimpleBitcoinVault — one vault contract per Bitcoin custody address on Hemi.
+    /// The BTC payout watcher calls currentSweepUTXO() to detect BTC payouts
+    /// without requiring the UTXO to remain unspent.
+    interface ISimpleBitcoinVault {
+        /// The Bitcoin txid (bytes32) of the most recent sweep transaction confirmed
+        /// by the vault operator via finalizeWithdrawal(). Returns zero if no sweep
+        /// has been processed yet.
+        function currentSweepUTXO() external view returns (bytes32);
+    }
+}
 
 sol! {
     /// BitcoinKitV1 — read-only precompile exposing Bitcoin state on Hemi.
@@ -498,6 +539,14 @@ pub mod topics {
     pub fn rounds_backfilled() -> B256 {
         keccak256(b"RoundsBackfilled(uint64,uint64,uint256)")
     }
+
+    // OptimismPortal events
+    pub fn withdrawal_proven() -> B256 {
+        keccak256(b"WithdrawalProven(bytes32,address,address)")
+    }
+    pub fn withdrawal_finalized() -> B256 {
+        keccak256(b"WithdrawalFinalized(bytes32,bool)")
+    }
 }
 
 // ============================================================================
@@ -543,8 +592,22 @@ pub mod addresses {
     pub const HEMI_SEPOLIA_POP_PAYOUTS_V2: Address =
         alloy::primitives::address!("4a3b61C586DB4CD219E85aC0697b66916c7457AB");
 
-    // Mainnet address pending confirmation from Hemi explorer.
-    // FIXME: confirm PoPPayoutsV2 mainnet address.
+    // Two PoPPayoutsV2 contracts were deployed on Hemi mainnet by the Hemi team
+    // (owner 0xE067Dd6965bd87C81AbE658ed42FC02eB41d5Bd3) at blocks ~3,497,671 and
+    // ~3,497,724. mintPoPRewards() has not yet been called on either — PoP payouts
+    // are not yet activated. The second deployment is used as the canonical address;
+    // update HEMI_POP_PAYOUTS_CONTRACT in .env if the Hemi team activates the first.
+    //
+    // Factory for first deployment:  0xf9705145175800f6f2e4a81261a4cb5406da6023 (block 3,497,671)
+    // Factory for second deployment: 0x92f03ea43ee029dbd28b63029d6f07e1efdb7a1a (block 3,497,724)
+
+    /// PoPPayoutsV2 deployment #1 on Hemi mainnet (block 3,497,671). Likely superseded by #2.
+    pub const HEMI_POP_PAYOUTS_V2_FIRST: Address =
+        alloy::primitives::address!("9417dd2eba413cfc11e8d8e368c007bfa1385a40");
+
+    /// PoPPayoutsV2 deployment #2 on Hemi mainnet (block 3,497,724). Use this as canonical.
+    pub const HEMI_POP_PAYOUTS_V2: Address =
+        alloy::primitives::address!("9a23ab7cb11cfb96e577da52a6ad5211ff24434b");
 
     // ---- BitcoinTunnelManager ----
     // Confirmed from Hemi explorer + hemilabs/bitcoin-tunnel-contracts repo.
@@ -593,6 +656,7 @@ mod tests {
             topics::erc20_bridge_initiated(),
             topics::deposit_confirmed(),
             topics::btc_withdrawal_initiated(),
+            topics::withdrawal_challenge_success(),
             topics::vault_created(),
             topics::payout_round_executed(),
         ];
