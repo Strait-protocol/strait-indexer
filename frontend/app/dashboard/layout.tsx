@@ -1,6 +1,7 @@
 import Link from "next/link";
 import AutoRefresh from "./AutoRefresh";
 import NetworkSwitcher from "./NetworkSwitcher";
+import MobileMenu from "./MobileMenu";
 
 export default function DashboardLayout({
   children,
@@ -21,7 +22,9 @@ export default function DashboardLayout({
               Explorer
             </Link>
           </div>
-          <div className="flex items-center gap-3 text-sm">
+
+          {/* Desktop nav — hidden on mobile, where MobileMenu takes over below */}
+          <div className="hidden md:flex items-center gap-3 text-sm">
             <NetworkSwitcher />
             <span className="inline-flex items-center gap-2 text-zinc-400" title="Auto-refreshes every 10s">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
@@ -34,6 +37,17 @@ export default function DashboardLayout({
               ← Home
             </Link>
           </div>
+
+          <MobileMenu>
+            <NetworkSwitcher />
+            <span className="inline-flex items-center gap-2 text-zinc-400" title="Auto-refreshes every 10s">
+              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+              live
+            </span>
+            <Link href="/" className="text-zinc-400 hover:text-white transition-colors">
+              ← Home
+            </Link>
+          </MobileMenu>
         </div>
       </header>
       <main className="max-w-6xl mx-auto px-6 py-10">{children}</main>

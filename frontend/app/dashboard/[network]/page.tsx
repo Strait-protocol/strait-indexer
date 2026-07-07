@@ -103,23 +103,25 @@ export default async function DashboardPage({
           <EmptyTransfers filtering={filtering} />
         ) : (
           <div className="overflow-hidden rounded-xl border border-white/[0.06]">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs uppercase tracking-wide text-zinc-500 border-b border-white/[0.06]">
-                  <th className="font-medium px-4 py-3">Route</th>
-                  <th className="font-medium px-4 py-3">Amount</th>
-                  <th className="font-medium px-4 py-3">Status</th>
-                  <th className="font-medium px-4 py-3">From</th>
-                  <th className="font-medium px-4 py-3">To</th>
-                  <th className="font-medium px-4 py-3 text-right">Age →</th>
-                </tr>
-              </thead>
-              <tbody>
-                {transfers.map((t) => (
-                  <TransferRow key={t.id} t={t} network={network} />
-                ))}
-              </tbody>
-            </table>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-180 text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wide text-zinc-500 border-b border-white/[0.06]">
+                    <th className="font-medium px-4 py-3">Route</th>
+                    <th className="font-medium px-4 py-3">Amount</th>
+                    <th className="font-medium px-4 py-3">Status</th>
+                    <th className="font-medium px-4 py-3">From</th>
+                    <th className="font-medium px-4 py-3">To</th>
+                    <th className="font-medium px-4 py-3 text-right">Age →</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {transfers.map((t) => (
+                    <TransferRow key={t.id} t={t} network={network} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
             <Pagination network={network} sp={sp} page={page} hasNextPage={hasNextPage} />
           </div>
         )}
