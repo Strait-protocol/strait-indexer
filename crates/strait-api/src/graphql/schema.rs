@@ -108,11 +108,20 @@ pub struct Stats {
 }
 
 /// How far back an analytics query looks.
+///
+/// Explicit `name`s: async-graphql's default SCREAMING_SNAKE_CASE conversion
+/// treats a letter-to-digit boundary as a new word, mangling `Last24h`/`Last30d`
+/// into `LAST_2_4H`/`LAST_3_0D` — confirmed via introspection against the live
+/// schema. Pin the wire names explicitly instead of relying on the derive.
 #[derive(Enum, Copy, Clone, Eq, PartialEq)]
 pub enum TimeWindow {
+    #[graphql(name = "LAST_24H")]
     Last24h,
+    #[graphql(name = "LAST_7D")]
     Last7d,
+    #[graphql(name = "LAST_30D")]
     Last30d,
+    #[graphql(name = "ALL_TIME")]
     AllTime,
 }
 
