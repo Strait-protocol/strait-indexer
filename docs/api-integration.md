@@ -38,11 +38,11 @@ single tunnel transfer.
 | GraphQL field (camelCase) | REST field (snake_case) | Type | Meaning |
 |---|---|---|---|
 | `id` | `id` | UUID | Deterministic id derived from the Hemi tx hash + log index. Stable — safe to use as a key. |
-| `asset` | `asset` | String | `BTC`, `ETH`, or an ERC-20 symbol. |
+| `asset` | `asset` | String | `BTC`, `ETH`, or an ERC-20 symbol. **Not implied by `route`** — see the note below. |
 | `direction` | `direction` | Enum | `IN` (into Hemi) or `OUT` (out of Hemi). |
 | `route` | `route` | Enum | `BTC_TO_HEMI` \| `HEMI_TO_BTC` \| `ETH_TO_HEMI` \| `HEMI_TO_ETH`. |
 | `amount` | `amount` | String | **Atomic units** (satoshis or wei) as a plain decimal string. See [§5](#5-amounts). |
-| `sender` | `sender` | String | Origin address (EVM `0x…` or a Bitcoin address). |
+| `sender` | `sender` | String | Origin address (EVM `0x…` or a Bitcoin address). See the `BTC_TO_HEMI` caveat in [§6](#6-field-caveats). |
 | `recipient` | `recipient` | String | Destination address. |
 | `status` | `status` | Enum | `INITIATED` \| `FINALIZED` \| `FAILED` \| `REORGED`. |
 | `sourceChain` | `source_chain` | Enum | `BITCOIN` \| `HEMI` \| `ETHEREUM`. |
@@ -59,6 +59,14 @@ single tunnel transfer.
 | `initiatedAt` | `initiated_at` | DateTime | When the transfer was first observed. |
 | `finalizedAt` | `finalized_at` | DateTime? | When it reached `FINALIZED`, or `null`. |
 | — | `created_at`, `updated_at` | DateTime | REST only — row bookkeeping timestamps. |
+
+> **`route` is a path, not a currency.** `ETH_TO_HEMI` and `HEMI_TO_ETH` cover every
+> asset the OP Stack standard bridge tunnels between Ethereum and Hemi — native ETH,
+> the HEMI token, WBTC, cbBTC, and any other bridged ERC-20 — not just `ETH`. Two
+> transfers on the same route can legitimately have different `asset` values. Always
+> read `asset` for the display unit; never infer it from `route` or `direction`.
+> `BTC_TO_HEMI` / `HEMI_TO_BTC` are the one exception — those routes only ever carry
+> native `BTC` (there's no BTC-side ERC-20 equivalent).
 
 ---
 
@@ -165,6 +173,12 @@ These reflect what is reliably populated **today**:
   mint) tx is real.
 - **BTC recipient on `HEMI_TO_BTC`** is recovered from the withdrawal transaction's
   calldata. If recovery fails it falls back to a `withdrawal-uuid-<n>` placeholder.
+- **`sender` on `BTC_TO_HEMI`** is always a `btctx:<txid>` placeholder, never a real
+  Bitcoin address. Bitcoin is UTXO-based — a deposit transaction can spend from
+  multiple input addresses, so there's no single unambiguous "sender" the way an EVM
+  tx has a `from`. Rather than guess, Strait stores a stable identifier keyed to the
+  deposit's own txid. This is permanent, not a placeholder awaiting enrichment — don't
+  poll waiting for it to become a real address.
 - **`popAnchored` / PoP fields** are set when a PoP keystone covers a `BTC_TO_HEMI`
   deposit's Hemi mint block. PoP anchoring is not required for `FINALIZED` — a deposit
   reaches `FINALIZED` at mint, and `popAnchored` upgrades to `true` independently when

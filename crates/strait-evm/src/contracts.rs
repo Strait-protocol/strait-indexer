@@ -17,7 +17,7 @@
 //!   mainnet explorer. Used by the Bitcoin watcher to verify deposits and
 //!   read OP_RETURN data without relying solely on a Bitcoin RPC node.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::sol;
 use strait_core::error::{Result, StraitError};
 
@@ -273,6 +273,87 @@ sol! {
 //     extract the Hemi destination address encoded in tunnel deposits
 //   - Watch custody addresses for new UTXOs instead of polling Bitcoin RPC
 // ============================================================================
+
+sol! {
+    /// Minimal ERC-20 metadata interface, used to resolve the symbol/decimals of
+    /// a bridged token from its contract address (the standard bridge events only
+    /// carry the address, not the symbol).
+    interface IERC20Metadata {
+        function symbol() external view returns (string memory);
+        function decimals() external view returns (uint8);
+    }
+}
+
+/// Best-effort `symbol()` call against an ERC-20 contract. Returns `None` on any
+/// RPC/decode failure (nonstandard token, transient error) rather than erroring —
+/// callers should fall back to an empty symbol.
+pub async fn fetch_erc20_symbol(
+    provider: &dyn alloy::providers::Provider,
+    token: Address,
+) -> Option<String> {
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
+
+    let calldata = IERC20Metadata::symbolCall {}.abi_encode();
+    let req = TransactionRequest::default().to(token).input(calldata.into());
+    let raw = provider.call(&req).await.ok()?;
+    IERC20Metadata::symbolCall::abi_decode_returns(&raw, false)
+        .ok()
+        .map(|r| r._0)
+}
+
+/// Best-effort `decimals()` call against an ERC-20 contract. Returns `None` on any
+/// RPC/decode failure — callers should fall back to a default (e.g. 18).
+pub async fn fetch_erc20_decimals(
+    provider: &dyn alloy::providers::Provider,
+    token: Address,
+) -> Option<u8> {
+    use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
+
+    let calldata = IERC20Metadata::decimalsCall {}.abi_encode();
+    let req = TransactionRequest::default().to(token).input(calldata.into());
+    let raw = provider.call(&req).await.ok()?;
+    IERC20Metadata::decimalsCall::abi_decode_returns(&raw, false)
+        .ok()
+        .map(|r| r._0)
+}
+
+/// A log entry as returned by `eth_getTransactionReceipt`, decoded independently
+/// of the full receipt shape.
+#[derive(Debug, serde::Deserialize)]
+struct RawLog {
+    address: Address,
+    topics: Vec<B256>,
+}
+
+/// A minimal, permissive view of `eth_getTransactionReceipt`'s result — just the
+/// `logs` field. OP-Stack deposit transactions (Hemi's L1→L2 mint txs) use
+/// transaction type `0x7e`, which `alloy_rpc_types_eth::TransactionReceipt`'s
+/// `type` enum (pinned to standard `0x0`-`0x4`) doesn't recognize, so decoding a
+/// full typed receipt for those errors out before we ever reach the logs. This
+/// struct only pulls `logs`, ignoring every other field (including `type`), so it
+/// decodes fine regardless of transaction type.
+#[derive(Debug, serde::Deserialize)]
+struct RawReceiptLogs {
+    logs: Vec<RawLog>,
+}
+
+/// Fetch just the `(address, topics)` of every log in `tx_hash`'s receipt, via a
+/// raw JSON-RPC call rather than `Provider::get_transaction_receipt` — see
+/// `RawReceiptLogs` for why. Returns `None` if the tx isn't found or the RPC call
+/// fails.
+pub async fn fetch_receipt_logs(
+    provider: &dyn alloy::providers::Provider,
+    tx_hash: B256,
+) -> Option<Vec<(Address, Vec<B256>)>> {
+    let receipt: RawReceiptLogs = provider
+        .client()
+        .request("eth_getTransactionReceipt", (tx_hash,))
+        .await
+        .ok()?;
+    Some(receipt.logs.into_iter().map(|l| (l.address, l.topics)).collect())
+}
 
 sol! {
     /// SimpleBitcoinVault — one vault contract per Bitcoin custody address on Hemi.

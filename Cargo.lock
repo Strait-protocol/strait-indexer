@@ -4574,11 +4574,13 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sqlx",
  "strait-core",
  "strait-store",
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

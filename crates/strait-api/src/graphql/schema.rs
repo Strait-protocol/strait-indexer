@@ -1,10 +1,12 @@
 //! GraphQL schema: types, the Query root, and the schema builder.
 
-use async_graphql::{Context, EmptyMutation, EmptySubscription, Object, Schema, SimpleObject};
-use chrono::{DateTime, Utc};
+use async_graphql::{
+    Context, Enum, EmptyMutation, EmptySubscription, Object, Schema, SimpleObject,
+};
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
-use strait_store::{Database, TunnelTransferRepo, TunnelTransferRow};
+use strait_store::{AnalyticsBucketRow, Database, TunnelTransferRepo, TunnelTransferRow};
 
 /// The assembled Strait GraphQL schema type.
 pub type StraitSchema = Schema<Query, EmptyMutation, EmptySubscription>;
@@ -105,6 +107,79 @@ pub struct Stats {
     pub pop_anchored: i64,
 }
 
+/// How far back an analytics query looks.
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+pub enum TimeWindow {
+    Last24h,
+    Last7d,
+    Last30d,
+    AllTime,
+}
+
+impl TimeWindow {
+    /// Lower bound on `initiated_at`, or `None` for all-time (no lower bound).
+    fn since(self) -> Option<DateTime<Utc>> {
+        match self {
+            TimeWindow::Last24h => Some(Utc::now() - Duration::hours(24)),
+            TimeWindow::Last7d => Some(Utc::now() - Duration::days(7)),
+            TimeWindow::Last30d => Some(Utc::now() - Duration::days(30)),
+            TimeWindow::AllTime => None,
+        }
+    }
+}
+
+/// Time-bucket size for `analyticsSeries`.
+#[derive(Enum, Copy, Clone, Eq, PartialEq)]
+pub enum Granularity {
+    Day,
+    Week,
+    Month,
+}
+
+impl Granularity {
+    /// The `date_trunc` field name this maps to.
+    fn as_sql(self) -> &'static str {
+        match self {
+            Granularity::Day => "day",
+            Granularity::Week => "week",
+            Granularity::Month => "month",
+        }
+    }
+}
+
+/// Transfer count + volume for one route/asset within one time bucket.
+/// `volume` is atomic units (sats / wei) as a plain decimal string — USD
+/// conversion is a client-side concern, not the indexer's.
+#[derive(SimpleObject)]
+pub struct AnalyticsBucket {
+    pub bucket_start: DateTime<Utc>,
+    pub route: String,
+    pub asset: String,
+    pub transfer_count: i64,
+    pub volume: String,
+}
+
+impl From<AnalyticsBucketRow> for AnalyticsBucket {
+    fn from(r: AnalyticsBucketRow) -> Self {
+        Self {
+            bucket_start: r.bucket_start,
+            route: r.route,
+            asset: r.asset,
+            transfer_count: r.transfer_count,
+            volume: r.volume.with_scale(0).to_string(),
+        }
+    }
+}
+
+/// Share of total transfers a route accounts for within a window.
+#[derive(SimpleObject)]
+pub struct RouteBreakdown {
+    pub route: String,
+    pub transfer_count: i64,
+    /// 0.0-1.0 of total transfers in the window.
+    pub share: f64,
+}
+
 pub struct Query;
 
 #[Object]
@@ -200,6 +275,48 @@ impl Query {
             reorged: n("REORGED"),
             pop_anchored: pop,
         })
+    }
+
+    /// Time-bucketed transfer count + volume per route/asset within `window`,
+    /// bucketed at `granularity`. Volume is atomic units — USD conversion
+    /// happens client-side.
+    async fn analytics_series(
+        &self,
+        ctx: &Context<'_>,
+        window: TimeWindow,
+        granularity: Granularity,
+    ) -> async_graphql::Result<Vec<AnalyticsBucket>> {
+        let db = db(ctx)?;
+        let repo = TunnelTransferRepo::new(db);
+        let rows = repo
+            .analytics_series(window.since(), granularity.as_sql())
+            .await
+            .map_err(to_gql)?;
+        Ok(rows.into_iter().map(AnalyticsBucket::from).collect())
+    }
+
+    /// Per-route share of total transfers within `window`.
+    async fn route_breakdown(
+        &self,
+        ctx: &Context<'_>,
+        window: TimeWindow,
+    ) -> async_graphql::Result<Vec<RouteBreakdown>> {
+        let db = db(ctx)?;
+        let repo = TunnelTransferRepo::new(db);
+        let rows = repo.route_breakdown(window.since()).await.map_err(to_gql)?;
+        let total: i64 = rows.iter().map(|(_, count)| count).sum();
+        Ok(rows
+            .into_iter()
+            .map(|(route, transfer_count)| RouteBreakdown {
+                route,
+                transfer_count,
+                share: if total > 0 {
+                    transfer_count as f64 / total as f64
+                } else {
+                    0.0
+                },
+            })
+            .collect())
     }
 }
 

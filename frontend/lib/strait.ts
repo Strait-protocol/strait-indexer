@@ -46,6 +46,9 @@ export type Transfer = {
   direction: string;
   route: string;
   amount: string;
+  /** For BTC_TO_HEMI this is always `btctx:<txid>`, never a real Bitcoin address —
+   *  Bitcoin's UTXO model has no single unambiguous sender. Permanent, not a
+   *  placeholder awaiting enrichment. See docs/api-integration.md §6. */
   sender: string;
   recipient: string;
   status: string;
@@ -205,6 +208,11 @@ export function transferKind(direction: string): { label: string; hint: string; 
     : { label: "Deposit", hint: "into Hemi", cls: "text-violet-300 border-violet-400/30" };
 }
 
+/** `route` is a path (`ETH_TO_HEMI` etc.), not a currency — the standard bridge
+ *  tunnels native ETH *and* any ERC-20 (HEMI, WBTC, cbBTC, ...) over the same ETH
+ *  routes. Never infer the display unit from `route`/`direction` — always use the
+ *  transfer's own `asset`. BTC routes are the one exception: those only ever
+ *  carry native BTC. See docs/api-integration.md §2. */
 export function routeLabel(route: string): string {
   const map: Record<string, string> = {
     BTC_TO_HEMI: "BTC → Hemi",
@@ -215,6 +223,13 @@ export function routeLabel(route: string): string {
   return map[route] ?? route;
 }
 
+/** Known gap: `tunnel_transfers` only stores the resolved ERC-20 *symbol*, not its
+ *  decimals (see docs/api-integration.md §5 and docs/tunnel-architecture.md
+ *  "Asset resolution") — so this assumes 18 for anything that isn't BTC. That's
+ *  correct for ETH and for tokens re-deployed on Hemi with 18 decimals (HEMI,
+ *  VUSD, XAUt as of writing), but would misformat a bridged token whose Hemi-side
+ *  contract uses a different decimals count (many wrapped-BTC tokens use 8 on
+ *  their home chain — verify before trusting this for a new asset). */
 function decimalsFor(asset: string): number {
   if (asset === "BTC") return 8;
   return 18; // ETH and ERC-20 default

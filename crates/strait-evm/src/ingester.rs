@@ -3,6 +3,7 @@
 //! Watches for TunnelIn, TunnelOut, TunnelOutComplete, and PoP events
 //! from the Hemi tunnel contracts and converts them to raw events.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::{SolCall, SolEvent};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use std::collections::BTreeMap;
 use tracing::{debug, error, info, instrument, warn};
@@ -38,6 +39,9 @@ pub struct EvmIngester {
     event_tx: mpsc::Sender<RawEvent>,
     /// Store handle for reading/writing the ingestion checkpoint.
     db: Database,
+    /// Cache of resolved ERC-20 symbol/decimals, keyed by token contract address —
+    /// avoids re-fetching metadata for every event from the same token.
+    erc20_metadata_cache: Mutex<HashMap<Address, (String, u8)>>,
 }
 
 impl EvmIngester {
@@ -58,6 +62,7 @@ impl EvmIngester {
             reorg_detector,
             event_tx,
             db,
+            erc20_metadata_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -332,6 +337,31 @@ impl EvmIngester {
         let fee = U256::from(receipt.gas_used)
             .checked_mul(U256::from(receipt.effective_gas_price))?;
         u256_to_bigdecimal(fee).ok()
+    }
+
+    /// Resolve an ERC-20 token's symbol and decimals from its contract, caching the
+    /// result so repeat events for the same token don't re-hit the RPC. Falls back to
+    /// an empty symbol / 18 decimals (best-effort) if either call fails — e.g. a
+    /// nonstandard token or a transient RPC error shouldn't block ingestion.
+    async fn resolve_erc20_metadata(&self, contract: Address) -> (String, u8) {
+        if let Some(cached) = self.erc20_metadata_cache.lock().await.get(&contract) {
+            return cached.clone();
+        }
+
+        let token_addr = AlloyAddress::from(contract.0);
+        let symbol = crate::contracts::fetch_erc20_symbol(&*self.provider, token_addr)
+            .await
+            .unwrap_or_default();
+        let decimals = crate::contracts::fetch_erc20_decimals(&*self.provider, token_addr)
+            .await
+            .unwrap_or(18);
+
+        let metadata = (symbol, decimals);
+        self.erc20_metadata_cache
+            .lock()
+            .await
+            .insert(contract, metadata.clone());
+        metadata
     }
 
     /// Get tunnel-contract logs across a window of blocks `[from_block, to_block]`.
@@ -731,7 +761,8 @@ impl EvmIngester {
         );
         let gas_fee = self.fetch_gas_fee(tx_hash).await;
         let amount_bd = u256_to_bigdecimal(amount)?;
-        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let (symbol, decimals) = self.resolve_erc20_metadata(local_token).await;
+        let asset = Asset::Erc20 { contract: local_token, symbol, decimals };
         let event = if self.chain == Chain::Ethereum {
             // On L1, a "finalized" bridge event is a withdrawal released to the user.
             RawEvent::Ethereum(EthereumEvent::TunnelRelease {
@@ -782,7 +813,8 @@ impl EvmIngester {
         );
         let gas_fee = self.fetch_gas_fee(tx_hash).await;
         let amount_bd = u256_to_bigdecimal(amount)?;
-        let asset = Asset::Erc20 { contract: local_token, symbol: String::new(), decimals: 18 };
+        let (symbol, decimals) = self.resolve_erc20_metadata(local_token).await;
+        let asset = Asset::Erc20 { contract: local_token, symbol, decimals };
         let event = if self.chain == Chain::Ethereum {
             // On L1, an "initiated" bridge event is a deposit being locked for L2.
             RawEvent::Ethereum(EthereumEvent::TunnelLock {

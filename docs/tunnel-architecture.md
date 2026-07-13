@@ -62,6 +62,14 @@ Hemi blockchain
 4. On success: DepositConfirmed event emitted, hBTC minted to recipient.
 ```
 
+**No recoverable sender:** Bitcoin is UTXO-based — a deposit tx can spend from
+multiple input addresses, so there's no single unambiguous "sender" the way an EVM
+tx has a `from`. Strait doesn't attempt to resolve one; `tunnel_transfers.sender`
+for `BTC_TO_HEMI` rows is a stable `btctx:<txid>` placeholder keyed to the deposit's
+own txid ([`strait-join/src/engine.rs`](../crates/strait-join/src/engine.rs), see
+`transfer_from_btc_deposit` and `transfer_from_hemi_event`), not a real address —
+and it's never replaced with one later.
+
 ### Withdrawal flow (Hemi → BTC)
 
 ```
@@ -175,6 +183,27 @@ event ERC20BridgeInitiated(address indexed localToken, address indexed remoteTok
 event WithdrawalProven(bytes32 indexed withdrawalHash, address indexed from, address indexed to);
 event WithdrawalFinalized(bytes32 indexed withdrawalHash, bool success);
 ```
+
+### Asset resolution (ERC-20 routes carry more than ETH)
+
+`ETH_TO_HEMI` / `HEMI_TO_ETH` is a **path**, not a currency — the standard bridge
+tunnels native ETH *and* any ERC-20 token deployed on both sides (the HEMI token,
+WBTC, cbBTC, VUSD, XAUt, etc.) over the same two routes. `ETHBridgeInitiated`/
+`Finalized` only fires for native ETH; `ERC20BridgeInitiated`/`Finalized` fires for
+everything else and carries `localToken` (the token contract address) but not its
+symbol or decimals — those have to be resolved with an on-chain `symbol()`/
+`decimals()` call against `localToken` (`strait_evm::contracts::fetch_erc20_symbol`/
+`fetch_erc20_decimals`, cached per token address in `EvmIngester`). Don't infer the
+asset from the route or chain name — always read the resolved symbol.
+
+**Gotcha:** Hemi's L1→L2 deposit transactions (the Hemi-side mint tx for an
+`ETH_TO_HEMI` deposit) use OP-Stack's transaction type `0x7e` ("Deposit
+Transaction"), which `alloy`'s typed `TransactionReceipt` decoder doesn't
+recognize (pinned to standard types `0x0`-`0x4`) — a plain
+`Provider::get_transaction_receipt` call on one of these fails outright before
+you ever reach the logs. Use `strait_evm::contracts::fetch_receipt_logs`, which
+fetches the receipt via a raw `eth_getTransactionReceipt` call and decodes only
+the `logs` field, ignoring `type`.
 
 ---
 

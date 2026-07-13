@@ -56,6 +56,17 @@ pub struct TunnelTransferRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One time-bucketed row from `analytics_series`: transfer count and total
+/// volume for a given route/asset within a `date_trunc`'d window.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct AnalyticsBucketRow {
+    pub bucket_start: DateTime<Utc>,
+    pub route: String,
+    pub asset: String,
+    pub transfer_count: i64,
+    pub volume: BigDecimal,
+}
+
 /// Repository over `tunnel_transfers`.
 pub struct TunnelTransferRepo<'a> {
     pool: &'a PgPool,
@@ -592,6 +603,57 @@ impl<'a> TunnelTransferRepo<'a> {
         .await
         .map_err(StraitError::Database)?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Time-bucketed transfer count + volume per route/asset, backing the
+    /// `analyticsSeries` GraphQL query.
+    ///
+    /// `granularity` must be one of `date_trunc`'s field names ("day" / "week" /
+    /// "month" — validated by the caller via the `Granularity` GraphQL enum, never
+    /// user-supplied free text). `since` filters to `initiated_at >= since`;
+    /// `None` means all-time (no lower bound).
+    pub async fn analytics_series(
+        &self,
+        since: Option<DateTime<Utc>>,
+        granularity: &str,
+    ) -> Result<Vec<AnalyticsBucketRow>> {
+        let rows = sqlx::query_as::<_, AnalyticsBucketRow>(
+            "SELECT
+                date_trunc($1, initiated_at) AS bucket_start,
+                route,
+                asset,
+                COUNT(*)::bigint AS transfer_count,
+                SUM(amount)      AS volume
+             FROM tunnel_transfers
+             WHERE $2::timestamptz IS NULL OR initiated_at >= $2
+             GROUP BY bucket_start, route, asset
+             ORDER BY bucket_start ASC",
+        )
+        .bind(granularity)
+        .bind(since)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
+    }
+
+    /// Per-route transfer counts within a window, backing the `routeBreakdown`
+    /// GraphQL query. `since` of `None` means all-time.
+    pub async fn route_breakdown(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT route, COUNT(*)::bigint
+             FROM tunnel_transfers
+             WHERE $1::timestamptz IS NULL OR initiated_at >= $1
+             GROUP BY route",
+        )
+        .bind(since)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(rows)
     }
 
     /// Number of transfers that have been PoP-anchored to Bitcoin.
