@@ -585,20 +585,26 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Total number of indexed transfers.
-    pub async fn count(&self) -> Result<i64> {
-        let row = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM tunnel_transfers")
-            .fetch_one(self.pool)
-            .await
-            .map_err(StraitError::Database)?;
+    /// Number of indexed transfers with `initiated_at >= since` (`None` = all-time).
+    pub async fn count(&self, since: Option<DateTime<Utc>>) -> Result<i64> {
+        let row = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM tunnel_transfers WHERE $1::timestamptz IS NULL OR initiated_at >= $1",
+        )
+        .bind(since)
+        .fetch_one(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
         Ok(row.0)
     }
 
-    /// Per-status counts across all indexed transfers.
-    pub async fn count_by_status(&self) -> Result<std::collections::HashMap<String, i64>> {
+    /// Per-status counts within `since` (`None` = all-time).
+    pub async fn count_by_status(&self, since: Option<DateTime<Utc>>) -> Result<std::collections::HashMap<String, i64>> {
         let rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT status, COUNT(*)::bigint FROM tunnel_transfers GROUP BY status",
+            "SELECT status, COUNT(*)::bigint FROM tunnel_transfers
+             WHERE $1::timestamptz IS NULL OR initiated_at >= $1
+             GROUP BY status",
         )
+        .bind(since)
         .fetch_all(self.pool)
         .await
         .map_err(StraitError::Database)?;
@@ -656,11 +662,14 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(rows)
     }
 
-    /// Number of transfers that have been PoP-anchored to Bitcoin.
-    pub async fn count_pop_anchored(&self) -> Result<i64> {
+    /// Number of transfers PoP-anchored to Bitcoin, within `since` (`None` = all-time).
+    pub async fn count_pop_anchored(&self, since: Option<DateTime<Utc>>) -> Result<i64> {
         let row = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*)::bigint FROM tunnel_transfers WHERE pop_anchored = true",
+            "SELECT COUNT(*)::bigint FROM tunnel_transfers
+             WHERE pop_anchored = true
+               AND ($1::timestamptz IS NULL OR initiated_at >= $1)",
         )
+        .bind(since)
         .fetch_one(self.pool)
         .await
         .map_err(StraitError::Database)?;
