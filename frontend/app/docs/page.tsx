@@ -1,5 +1,6 @@
 import Link from "next/link";
 import DocsSidebars from "./DocsSidebars";
+import NavBar from "../components/NavBar";
 
 export const metadata = {
   title: "Strait — Docs",
@@ -10,47 +11,32 @@ export const metadata = {
 export default function DocsPage() {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans">
-      <DocsNav />
+      <NavBar
+        extras={
+          <a
+            href="https://github.com/Godbrand0/strait"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-zinc-400 hover:text-white transition-colors"
+          >
+            GitHub
+          </a>
+        }
+      />
       <DocsSidebars />
       <div className="xl:ml-56 xl:mr-52">
-        <main className="max-w-3xl mx-auto px-6 pt-28 pb-24 space-y-16">
+        <main className="max-w-3xl mx-auto px-6 pt-12 pb-24 space-y-16">
           <Hero />
           <Overview />
           <DataModel />
           <Lifecycle />
           <UsingTheApi />
+          <Webhooks />
           <Contracts />
           <Footer />
         </main>
       </div>
     </div>
-  );
-}
-
-/* ── Nav ─────────────────────────────────────────────────────────────────── */
-
-function DocsNav() {
-  return (
-    <nav className="fixed top-0 inset-x-0 z-50 border-b border-white/[0.06] bg-[#0a0a0a]/80 backdrop-blur-md">
-      <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
-        <Link href="/" className="text-orange-400 font-mono text-xl font-bold tracking-tight">
-          ⊕ Strait
-        </Link>
-        <div className="flex items-center gap-6 text-sm text-zinc-400">
-          <Link href="/dashboard/mainnet" className="hover:text-white transition-colors">
-            Explorer
-          </Link>
-          <a
-            href="https://github.com/Godbrand0/strait"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="hover:text-white transition-colors"
-          >
-            GitHub
-          </a>
-        </div>
-      </div>
-    </nav>
   );
 }
 
@@ -74,6 +60,7 @@ function Hero() {
           ["The data", "data"],
           ["Lifecycle", "lifecycle"],
           ["Using the API", "api"],
+          ["Webhooks", "webhooks"],
           ["Contracts", "contracts"],
         ].map(([label, id]) => (
           <a
@@ -307,6 +294,9 @@ function UsingTheApi() {
               ["GET /graphql", "GraphiQL playground"],
               ["GET /transfers?limit=&offset=", "REST: list transfers"],
               ["GET /transfers/:id", "REST: one transfer by UUID"],
+              ["POST /webhooks", "Register a webhook subscription"],
+              ["GET · DELETE /webhooks/:id", "Inspect · remove a subscription (token-gated)"],
+              ["GET /webhooks/:id/deliveries", "Last 20 delivery attempts (token-gated)"],
               ["GET /health · /health/db", "Liveness · DB connectivity"],
             ].map(([e, d]) => (
               <tr key={e} className="border-b border-white/[0.04] last:border-0">
@@ -332,8 +322,18 @@ function UsingTheApi() {
 { searchTransfers(query: "bc1qwql2…", status: "FINALIZED", route: "HEMI_TO_BTC") {
     id amount status finalizedAt } }
 
-# Aggregate stats
-{ stats { totalTransfers } }`}</Pre>
+# Aggregate stats — optionally scoped to a window
+{ stats { totalTransfers finalized failed } }
+{ stats(window: LAST_24H) { totalTransfers finalized } }
+
+# Time-bucketed analytics: count + volume per route/asset.
+# window: LAST_24H | LAST_7D | LAST_30D | ALL_TIME · granularity: DAY | WEEK | MONTH
+# volume is atomic units (sats/wei) per asset — convert client-side.
+{ analyticsSeries(window: LAST_30D, granularity: DAY) {
+    bucketStart route asset transferCount volume } }
+
+# Which route dominates a window (share is 0–1 of total transfers)
+{ routeBreakdown(window: LAST_7D) { route transferCount share } }`}</Pre>
 
       <h3 id="api-examples" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Examples</h3>
       <Pre>{`// TypeScript — search via GraphQL
@@ -351,15 +351,235 @@ curl 'http://localhost:8080/transfers?limit=20'
 curl 'http://localhost:8080/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'`}</Pre>
 
       <Callout>
-        <strong>Polling for finality:</strong> there&apos;s no subscription/webhook endpoint
-        yet — poll. If you know your source tx hash (you always do — you just submitted
-        it), use <Code>searchTransfers(query: &quot;0xyourtxhash&quot;)</Code> every
-        ~10–15s rather than matching by amount/route/time — it finds your transfer
-        directly instead of guessing. Fall back to <Code>transfersByRecipient</Code> only
-        if you don&apos;t have a tx hash yet. Stop when{" "}
-        <Code>status === &quot;FINALIZED&quot;</Code> (or <Code>FAILED</Code> /{" "}
-        <Code>REORGED</Code>).
+        <strong>Watching for finality:</strong> prefer a{" "}
+        <a href="#webhooks" className="text-orange-300 underline decoration-orange-300/40 hover:decoration-orange-300">
+          webhook
+        </a>{" "}
+        — Strait pushes the change to you the moment it lands. If you&apos;d rather poll:
+        you know your source tx hash (you just submitted it), so use{" "}
+        <Code>searchTransfers(query: &quot;0xyourtxhash&quot;)</Code> every ~10–15s rather
+        than matching by amount/route/time — it finds your transfer directly instead of
+        guessing. Fall back to <Code>transfersByRecipient</Code> only if you don&apos;t
+        have a tx hash yet. Stop when <Code>status === &quot;FINALIZED&quot;</Code> (or{" "}
+        <Code>FAILED</Code> / <Code>REORGED</Code>).
       </Callout>
+    </Section>
+  );
+}
+
+function Webhooks() {
+  return (
+    <Section id="webhooks" title="Webhooks">
+      <p>
+        Push notifications for transfer lifecycle events: register a URL and Strait POSTs an
+        HMAC-signed JSON payload to it whenever a matching transfer changes. Deliveries are
+        backed by a durable outbox — a node restart never drops one — and failed POSTs retry
+        with exponential backoff (10s → 24h, 8 attempts). Delivery is{" "}
+        <strong>at-least-once</strong>: dedupe on the <Code>X-Strait-Delivery</Code> header.
+      </p>
+
+      <h3 id="webhooks-register" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Registering</h3>
+      <Pre>{`curl -X POST http://localhost:8080/webhooks \\
+  -H 'content-type: application/json' \\
+  -d '{
+    "url": "https://example.com/strait-hook",
+    "routes":   ["HEMI_TO_BTC", "HEMI_TO_ETH"],
+    "assets":   ["BTC", "ETH"],
+    "statuses": ["FINALIZED", "FAILED"]
+  }'`}</Pre>
+      <p>
+        Filters are optional — omit a dimension to match everything on it. The URL must be
+        public <Code>http(s)</Code>; loopback and private-network hosts are rejected.
+      </p>
+      <Callout>
+        <strong>The response contains two credentials, shown exactly once.</strong>{" "}
+        <Code>signing_secret</Code> is the HMAC key every delivery to you is signed with;{" "}
+        <Code>management_token</Code> is required to inspect or delete the subscription
+        later. Store both immediately — the API never discloses them again. Lose them and
+        you re-register.
+      </Callout>
+
+      <h3 id="webhooks-deliveries" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Deliveries</h3>
+      <div className="overflow-hidden rounded-xl border border-white/[0.07]">
+        <table className="w-full text-sm">
+          <tbody>
+            {[
+              ["X-Strait-Signature", "sha256=<hex HMAC-SHA256 of the raw body under your signing_secret>"],
+              ["X-Strait-Event", "transfer.created · transfer.status_changed · transfer.pop_anchored · transfer.retracted"],
+              ["X-Strait-Delivery", "Unique delivery id — your dedupe key"],
+            ].map(([h, d]) => (
+              <tr key={h} className="border-b border-white/[0.04] last:border-0">
+                <td className="px-4 py-3 font-mono text-orange-300 whitespace-nowrap align-top">{h}</td>
+                <td className="px-4 py-3 text-zinc-300">{d}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p>
+        The body is{" "}
+        <Code>{`{ "event", "timestamp", "transfer": { … } }`}</Code> where{" "}
+        <Code>transfer</Code> has the same snake_case shape as <Code>GET /transfers</Code>{" "}
+        rows. Respond with any <Code>2xx</Code> within 10 seconds to acknowledge — anything
+        else (or a timeout) schedules a retry.
+      </p>
+
+      <h3 id="webhooks-verify" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Verifying signatures</h3>
+      <p>
+        Always verify before trusting a payload — anyone who discovers your endpoint URL can
+        POST fake events to it; only Strait knows your <Code>signing_secret</Code>. Verify
+        over the <strong>raw request bytes</strong>: re-serializing parsed JSON can reorder
+        keys and break the digest.
+      </p>
+      <Pre>{`import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(rawBody /* Buffer */, signatureHeader, secret) {
+  const expected =
+    "sha256=" + createHmac("sha256", secret).update(rawBody).digest("hex");
+  return timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
+}`}</Pre>
+      <p>
+        What those two calls do (<Code>node:crypto</Code> ships with Node — no npm package):{" "}
+        <Code>createHmac</Code> recomputes the HMAC-SHA256 signature Strait attached — only a
+        holder of your <Code>signing_secret</Code> can produce it, and changing one byte of
+        the body changes it completely, so a match proves the payload is genuinely from
+        Strait and untampered. <Code>timingSafeEqual</Code> compares the signatures in{" "}
+        <strong>constant time</strong>: a plain <Code>===</Code> returns faster the earlier
+        the first mismatch is, and that timing difference — measured over many forged
+        requests — can leak a valid signature byte by byte. Constant-time comparison closes
+        that side channel.
+      </p>
+
+      <h3 id="webhooks-credentials" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Credentials &amp; subscriptions</h3>
+      <p>
+        <strong className="text-white">One subscription per service, not per end-user.</strong>{" "}
+        Strait doesn&apos;t know about your users — it notifies <em>you</em> about transfers.
+        A wallet with 10,000 users runs <strong>one</strong> subscription (per environment)
+        pointed at its backend; when a delivery arrives, match{" "}
+        <Code>transfer.recipient</Code> (or <Code>sender</Code>) against your own users table
+        to decide who to notify.
+      </p>
+      <div className="overflow-hidden rounded-xl border border-white/[0.07]">
+        <table className="w-full text-sm">
+          <tbody>
+            {[
+              ["id", "Not secret — config/env; needed for GET / DELETE /webhooks/:id"],
+              ["signing_secret", "Secret — env var / secret manager; your receiver reads it to verify deliveries"],
+              ["management_token", "Secret — secret manager; only needed to inspect or delete the subscription"],
+            ].map(([v, d]) => (
+              <tr key={v} className="border-b border-white/[0.04] last:border-0">
+                <td className="px-4 py-3 font-mono text-orange-300 whitespace-nowrap align-top">{v}</td>
+                <td className="px-4 py-3 text-zinc-300">{d}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Register separately for staging and production, each with its own URL and secrets. To
+        rotate, register a new subscription, accept both secrets during the cutover, then
+        delete the old one. The API never re-discloses secrets — if you lose the management
+        token, keep returning <Code>2xx</Code> (and ignore the events) so retries don&apos;t
+        pile up, and ask the operator to remove the row.
+      </p>
+
+      <h3 id="webhooks-integrate" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Integrating with your backend</h3>
+      <p>
+        Two rules for every receiver: verify the signature over the <strong>raw request
+        bytes</strong> (parse JSON only after the check — body-parsing middleware that
+        re-serializes breaks the digest), and <strong>acknowledge fast</strong> — return{" "}
+        <Code>2xx</Code>, then do your real work asynchronously. A handler slower than 10s
+        looks like a failure and gets retried, which you&apos;ll then process twice.
+      </p>
+      <p className="text-sm text-zinc-400">Express:</p>
+      <Pre>{`import express from "express";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const app = express();
+const SECRET = process.env.STRAIT_SIGNING_SECRET;
+
+// express.raw (NOT express.json) so we verify the exact bytes.
+app.post("/strait-hook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.get("X-Strait-Signature") ?? "";
+  const expected = "sha256=" + createHmac("sha256", SECRET).update(req.body).digest("hex");
+  if (sig.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return res.status(401).send("bad signature");
+  }
+
+  res.status(200).send("ok"); // ack first — work after
+
+  const deliveryId = req.get("X-Strait-Delivery"); // your dedupe key
+  const { event, transfer } = JSON.parse(req.body);
+  if (event === "transfer.status_changed" && transfer.status === "FINALIZED") {
+    // mark the user's bridge complete, send a push notification…
+  }
+});`}</Pre>
+      <p className="text-sm text-zinc-400">Next.js (App Router route handler):</p>
+      <Pre>{`// app/api/strait-hook/route.ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+export async function POST(req: Request) {
+  const raw = Buffer.from(await req.arrayBuffer()); // raw bytes, not req.json()
+  const sig = req.headers.get("x-strait-signature") ?? "";
+  const expected = "sha256=" +
+    createHmac("sha256", process.env.STRAIT_SIGNING_SECRET!).update(raw).digest("hex");
+  if (sig.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return new Response("bad signature", { status: 401 });
+  }
+
+  const deliveryId = req.headers.get("x-strait-delivery"); // your dedupe key
+  const { event, transfer } = JSON.parse(raw.toString());
+  // handle the event (keep it quick, or hand off to a queue)…
+  return new Response("ok");
+}`}</Pre>
+      <p>
+        <strong className="text-white">Recommended pattern — webhook + poll reconciliation.</strong>{" "}
+        On submit, store a <Code>pending</Code> row in your DB keyed by the source tx hash.
+        On webhook, match <Code>transfer.source_tx_hash</Code> to that row, update it,
+        notify the user. Then reconcile: webhooks are at-least-once, but if your endpoint is
+        down longer than the retry window (~1.5 days) a delivery can permanently fail — so
+        sweep your still-pending rows every ~10 minutes and resolve them by polling:
+      </p>
+      <Pre>{`async function fetchByTxHash(txHash) {
+  const res = await fetch("http://localhost:8080/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query: \`query($q: String) {
+        searchTransfers(query: $q, limit: 1) {
+          id status route asset amount destTxHash finalizedAt
+        }
+      }\`,
+      variables: { q: txHash },
+    }),
+  });
+  const { data } = await res.json();
+  return data?.searchTransfers?.[0] ?? null;
+}`}</Pre>
+      <p>
+        The webhook gives you low latency; the sweep guarantees you never miss a terminal
+        state. Both read the same records, so they can share handling code.
+      </p>
+
+      <h3 id="webhooks-manage" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Managing a subscription</h3>
+      <p>
+        The{" "}
+        <Link href="/webhooks" className="text-orange-300 underline decoration-orange-300/40 hover:decoration-orange-300">
+          Webhooks page
+        </Link>{" "}
+        does all of this in the browser — register, inspect delivery history, delete. The
+        same operations over curl:
+      </p>
+      <Pre>{`# Inspect (metadata only — secrets are never returned)
+curl http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'
+
+# Last 20 delivery attempts: event, status, attempt count, response time, error
+curl http://localhost:8080/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
+
+# Unsubscribe (pending deliveries are removed with it)
+curl -X DELETE http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'`}</Pre>
     </Section>
   );
 }

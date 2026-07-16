@@ -41,7 +41,7 @@ to Postgres/Supabase, and serves them over REST + GraphQL with a web dashboard o
 | Checkpointing / resumability / historical backfill | ✅ Built |
 | REST (`/transfers`) + GraphQL (`/graphql`) API | ✅ Built |
 | Web dashboard (Next.js tunnel explorer + finality timeline) | ✅ Built |
-| Webhooks (push notifications) | 🚧 Planned |
+| Webhooks (push notifications) | ✅ HMAC-signed, durable outbox with retry, route/asset/status filters |
 | Vault auto-discovery for the BTC watch-set | ✅ Vault addresses discovered and configured (9 vaults, June 2026) |
 
 The GraphQL schema and setup steps documented below reflect what is **actually
@@ -390,11 +390,35 @@ type Stats { totalTransfers: Int! }
 The REST endpoint `GET /transfers?limit=&offset=` returns the same records as JSON, and
 `GET /health` is a liveness probe.
 
-### Webhooks _(planned)_
+### Webhooks
 
-Push notifications (HMAC-signed delivery, filtered by route/asset/status) are on the
-roadmap but **not yet implemented**. Until then, poll `GET /transfers` or the GraphQL
-`transfers` query.
+Push notifications for transfer lifecycle events, HMAC-signed and filtered by
+route/asset/status. Backed by a durable outbox (`webhook_deliveries`), so
+deliveries survive restarts; failed POSTs retry with exponential backoff (10s →
+24h, 8 attempts). Delivery is **at-least-once** — dedupe on the
+`X-Strait-Delivery` header.
+
+```bash
+# Register (returns signing_secret + management_token ONCE — store them)
+curl -X POST http://localhost:8080/webhooks \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://example.com/hook", "routes": ["HEMI_TO_BTC"], "statuses": ["FINALIZED"]}'
+
+# Inspect / delivery history / delete (requires the management token from registration)
+curl http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'
+curl http://localhost:8080/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
+curl -X DELETE http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'
+```
+
+Or skip curl entirely — the explorer's `/webhooks` page registers and manages
+subscriptions (including delivery history) in the browser.
+
+Each delivery is a JSON POST with `X-Strait-Signature: sha256=<hex>` (HMAC-SHA256
+of the raw body under your `signing_secret`), `X-Strait-Event` (e.g.
+`transfer.status_changed`), and `X-Strait-Delivery` (unique id). Payload:
+`{ "event", "timestamp", "transfer": { ...same shape as GET /transfers... } }`.
+See [`docs/api-integration.md`](docs/api-integration.md) §10 for signature
+verification examples.
 
 ---
 

@@ -29,11 +29,9 @@ function Nav() {
           </span>
         </div>
         <div className="hidden md:flex items-center gap-8 text-sm text-zinc-400">
-          <a href="#how-it-works" className="hover:text-white transition-colors">How It Works</a>
-          <a href="#why-better" className="hover:text-white transition-colors">Why Strait</a>
           <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
           <a href="/docs" className="hover:text-white transition-colors">Docs</a>
-          <a href="#roadmap" className="hover:text-white transition-colors">Roadmap</a>
+          <a href="/webhooks" className="hover:text-white transition-colors">Webhooks</a>
         </div>
         <div className="flex items-center gap-3">
           <a
@@ -646,18 +644,29 @@ function BuiltOnStrait() {
       status: 'Live',
       desc: 'The GraphQL and REST API that powers everything here — full Transfer schema, queries, contract addresses, and a self-host guide.',
       cta: 'Read the docs',
+      href: '/docs',
     },
     {
       name: 'Strait Analytics',
-      status: 'In progress',
+      status: 'Live',
       desc: 'Volume, TVL, route utilization, average finality time, and flow charts — Dune-style dashboards built straight off the indexed tunnel data.',
-      cta: 'Build with the API',
+      cta: 'Open Analytics',
+      href: 'https://strait-analytics.vercel.app/',
+      external: true,
+    },
+    {
+      name: 'Strait Webhooks',
+      status: 'In progress',
+      desc: 'HMAC-signed push notifications for transfer lifecycle events — register a URL, get notified the moment a matching transfer finalizes or fails.',
+      cta: 'Register a webhook',
+      href: '/webhooks',
     },
     {
       name: 'Strait BTC-Collateralized Cross-Chain Lending',
       status: 'Idea',
       desc: 'Use Bitcoin-anchored tunnel transfers as a settlement and collateral signal — lend against BTC bridged into Hemi, settled across chains.',
       cta: 'Explore the idea',
+      href: '/docs',
     },
   ];
   const badge = (s: string) => {
@@ -681,11 +690,12 @@ function BuiltOnStrait() {
             Strait is infrastructure. Every app below reads the same indexed tunnel data — start with the developer docs.
           </p>
         </div>
-        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-5">
+        <div className="grid md:grid-cols-2 gap-5">
           {apps.map((a) => (
             <a
               key={a.name}
-              href="/docs"
+              href={a.href}
+              {...(a.external ? { target: "_blank", rel: "noopener noreferrer" } : {})}
               className="group rounded-2xl border border-white/[0.07] bg-white/[0.03] p-6 flex flex-col hover:border-orange-500/40 transition-colors"
             >
               <div className="mb-3">{badge(a.status)}</div>
@@ -875,7 +885,8 @@ function Footer() {
         </div>
         <div className="flex items-center gap-6 text-sm text-zinc-500">
           <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
-          <a href="#how-it-works" className="hover:text-white transition-colors">Docs</a>
+          <a href="/docs" className="hover:text-white transition-colors">Docs</a>
+          <a href="/webhooks" className="hover:text-white transition-colors">Webhooks</a>
           <a
             href="https://github.com/strait-data/strait"
             className="hover:text-white transition-colors"
@@ -884,7 +895,6 @@ function Footer() {
           >
             GitHub
           </a>
-          <a href="#roadmap" className="hover:text-white transition-colors">Roadmap</a>
           <span>MIT License</span>
         </div>
       </div>

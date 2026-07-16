@@ -2,9 +2,20 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
+import Dropdown from "../components/Dropdown";
+import { routeLabel } from "@/lib/strait";
 
 const STATUSES = ["INITIATED", "ANCHORED", "FINALIZED", "FAILED", "REORGED"];
 const ROUTES = ["BTC_TO_HEMI", "HEMI_TO_BTC", "ETH_TO_HEMI", "HEMI_TO_ETH"];
+
+const statusOptions = [
+  { value: "", label: "All statuses" },
+  ...STATUSES.map((s) => ({ value: s, label: s })),
+];
+const routeOptions = [
+  { value: "", label: "All routes" },
+  ...ROUTES.map((r) => ({ value: r, label: routeLabel(r) })),
+];
 
 const field =
   "rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-white focus:border-orange-400/50 focus:outline-none";
@@ -49,22 +60,18 @@ export default function SearchFilter({ network }: { network: string }) {
           spellCheck={false}
         />
       </form>
-      <select value={status} onChange={(e) => apply({ status: e.target.value })} className={field}>
-        <option className="text-black" value="">All statuses</option>
-        {STATUSES.map((s) => (
-          <option className="text-black" key={s} value={s}>
-            {s}
-          </option>
-        ))}
-      </select>
-      <select value={route} onChange={(e) => apply({ route: e.target.value })} className={field}>
-        <option className="text-black" value="">All routes</option>
-        {ROUTES.map((r) => (
-          <option className="text-black" key={r} value={r}>
-            {r.replace(/_/g, " → ").replace("BTC", "BTC").replace("ETH", "ETH")}
-          </option>
-        ))}
-      </select>
+      <Dropdown
+        value={status}
+        options={statusOptions}
+        onChange={(v) => apply({ status: v })}
+        className="w-40"
+      />
+      <Dropdown
+        value={route}
+        options={routeOptions}
+        onChange={(v) => apply({ route: v })}
+        className="w-40"
+      />
       {active ? (
         <button
           onClick={() => {

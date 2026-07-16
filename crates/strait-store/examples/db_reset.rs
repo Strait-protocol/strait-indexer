@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let statements = [
         "DROP TABLE IF EXISTS tunnel_transfers CASCADE",
         "DROP TABLE IF EXISTS webhook_deliveries CASCADE",
+        "DROP TABLE IF EXISTS webhook_subscriptions CASCADE",
         "DROP TABLE IF EXISTS pop_proofs CASCADE",
         "DROP TABLE IF EXISTS events CASCADE",
         "DROP TABLE IF EXISTS checkpoints CASCADE",

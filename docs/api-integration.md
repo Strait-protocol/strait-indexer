@@ -24,6 +24,10 @@ The node serves the API on `API_HOST:API_PORT` (default `0.0.0.0:8080`).
 | `GET  /transfers/:id` | REST | One transfer by UUID |
 | `GET  /health` | REST | Liveness |
 | `GET  /health/db` | REST | Database connectivity |
+| `POST /webhooks` | REST | Register a webhook subscription (see [§10](#10-webhooks)) |
+| `GET  /webhooks/:id` | REST | Inspect a subscription (`X-Management-Token`) |
+| `GET  /webhooks/:id/deliveries` | REST | Last 20 delivery attempts (`X-Management-Token`) |
+| `DELETE /webhooks/:id` | REST | Remove a subscription (`X-Management-Token`) |
 
 > Open `http://<host>:8080/graphql` in a browser to explore the schema interactively
 > with GraphiQL.
@@ -118,8 +122,28 @@ A robust integration treats `FINALIZED` as "done" and anything else as "in fligh
   }
 }
 
-# Aggregate stats.
-{ stats { totalTransfers } }
+# Search by address / tx hash / id, with optional status & route filters.
+{
+  searchTransfers(query: "0xabc123…", status: "FINALIZED", route: "HEMI_TO_BTC") {
+    id amount status finalizedAt
+  }
+}
+
+# Aggregate stats — optionally scoped to a time window.
+{ stats { totalTransfers finalized failed } }
+{ stats(window: LAST_24H) { totalTransfers finalized } }
+
+# Time-bucketed analytics: transfer count + volume per route/asset.
+# window: LAST_24H | LAST_7D | LAST_30D | ALL_TIME · granularity: DAY | WEEK | MONTH
+# volume is atomic units (sats/wei) per asset — convert client-side, never sum across assets.
+{
+  analyticsSeries(window: LAST_30D, granularity: DAY) {
+    bucketStart route asset transferCount volume
+  }
+}
+
+# Which route dominates a window (share is 0–1 of total transfers).
+{ routeBreakdown(window: LAST_7D) { route transferCount share } }
 ```
 
 All list queries accept `limit` (1–500, default 50) and `offset` (default 0).
@@ -194,9 +218,10 @@ These reflect what is reliably populated **today**:
 
 ---
 
-## 7. Real-time updates (polling)
+## 7. Real-time updates (polling or webhooks)
 
-There is **no subscription/webhook endpoint yet** — poll. Recommended pattern:
+For push notifications, register a webhook ([§10](#10-webhooks)). If you'd rather
+poll (or need the state right now rather than on change), the recommended pattern:
 
 ```
 1. Submit a bridge tx. You already know its tx hash — use it, don't fuzzy-match.
@@ -273,3 +298,235 @@ curl -s http://localhost:8080/graphql \
   with `{ "error": "…" }`.
 - **Stability:** `id`, `route`, `status`, and the atomic-unit `amount` are stable
   contracts. Treat enum sets as potentially additive over time.
+
+---
+
+## 10. Webhooks
+
+Push notifications for transfer lifecycle events — an HMAC-signed JSON POST to
+your URL whenever a matching transfer changes. Backed by a durable outbox, so a
+node restart never drops a delivery. Delivery is **at-least-once**: dedupe on
+the `X-Strait-Delivery` header if a replay would hurt you.
+
+### Registering
+
+```bash
+curl -X POST http://localhost:8080/webhooks \
+  -H 'content-type: application/json' \
+  -d '{
+    "url": "https://example.com/strait-hook",
+    "routes":   ["HEMI_TO_BTC", "HEMI_TO_ETH"],
+    "assets":   ["BTC", "ETH"],
+    "statuses": ["FINALIZED", "FAILED"]
+  }'
+```
+
+Filters are optional — omit a dimension to match everything on it. The URL must
+be public `http(s)`; loopback/private/link-local hosts are rejected.
+
+The `201` response contains two credentials **returned only once**:
+
+- `signing_secret` — HMAC-SHA256 key used to sign every delivery to you.
+- `management_token` — required (as the `X-Management-Token` header) to
+  `GET /webhooks/:id` (inspect) or `DELETE /webhooks/:id` (unsubscribe).
+
+Losing them means registering a new webhook — the API never discloses them again.
+
+### Deliveries
+
+Each event is a POST with headers:
+
+| Header | Meaning |
+|---|---|
+| `X-Strait-Signature` | `sha256=<hex HMAC-SHA256 of the raw request body under your signing_secret>` |
+| `X-Strait-Event` | `transfer.created` \| `transfer.status_changed` \| `transfer.pop_anchored` \| `transfer.retracted` |
+| `X-Strait-Delivery` | Unique delivery id — your dedupe key |
+
+Body: `{ "event": "...", "timestamp": "...", "transfer": { ... } }` where
+`transfer` is the same snake_case shape as `GET /transfers` rows (see [§2](#2-the-transfer-object)).
+
+Respond with any `2xx` within 10 seconds to acknowledge. Anything else (or a
+timeout) schedules a retry with exponential backoff — 10s, 1m, 10m, 1h, 6h, then
+24h — up to 8 attempts before the delivery is marked permanently failed.
+
+To debug your receiver, list the last 20 attempts (event, status, attempt count,
+response time in ms, last error):
+
+```bash
+curl http://localhost:8080/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
+```
+
+The explorer's **/webhooks** page does the same in a browser — register,
+inspect delivery history, delete — if you'd rather not curl.
+
+### Verifying the signature
+
+Always verify before trusting a payload — anyone who discovers your endpoint URL
+can POST fake events to it; only Strait knows your `signing_secret`.
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verify(rawBody /* Buffer */, signatureHeader, secret) {
+  const expected = "sha256=" + createHmac("sha256", secret).update(rawBody).digest("hex");
+  return timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
+}
+```
+
+```python
+import hashlib, hmac
+
+def verify(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature_header, expected)
+```
+
+Sign-and-compare must use the **raw request bytes** — re-serializing the parsed
+JSON can reorder keys and break the digest.
+
+**What the two crypto calls are doing** (`node:crypto` is built into Node — no
+npm package needed):
+
+- `createHmac("sha256", secret)` recomputes the signature Strait attached:
+  HMAC-SHA256 of the body under your `signing_secret`. Only a holder of the
+  secret can produce a valid signature, and changing even one byte of the body
+  changes it completely — so a match proves the payload came from Strait and
+  wasn't tampered with. Without this check, anyone who discovers your endpoint
+  URL could POST a fake `"status": "FINALIZED"` event and your backend would
+  believe it.
+- `timingSafeEqual` compares the two signatures in **constant time**. A plain
+  `===` short-circuits at the first mismatched character, so failures return a
+  few nanoseconds faster or slower depending on *how much* of a forged
+  signature was correct — enough signal, over many requests, to reconstruct a
+  valid signature byte by byte (a timing attack). `timingSafeEqual` always
+  compares every byte, so response timing leaks nothing. (Python's
+  `hmac.compare_digest` is the same idea.)
+
+### Storing credentials & handling subscriptions
+
+**Register one subscription per service, not per end-user.** Strait doesn't
+know about your users — it notifies *you* about transfers. A wallet with 10,000
+users runs **one** subscription (per environment) pointed at its backend; when
+a delivery arrives, match `transfer.recipient` (or `sender`) against your own
+users table to decide who to notify. Don't create a webhook per user — you'd
+be managing thousands of secrets for no gain, and every subscription receives
+its own copy of every matching event anyway.
+
+**Store the three values from registration like API keys:**
+
+| Value | Secret? | Where to keep it |
+|---|---|---|
+| `id` | No | Config/env — needed for `GET`/`DELETE /webhooks/:id` |
+| `signing_secret` | **Yes** | Env var or secret manager (`STRAIT_SIGNING_SECRET`) — your receiver reads it to verify deliveries |
+| `management_token` | **Yes** | Secret manager — only needed when inspecting or deleting the subscription |
+
+Never in the repo, never in client-side code — the signing secret is only
+useful server-side anyway, since verification happens where deliveries land.
+
+**Environments:** register separately for staging and production, each with its
+own URL and its own secrets. Filters can differ too (e.g. staging subscribes to
+everything, production only to `FINALIZED`/`FAILED`).
+
+**Rotation and loss:** the API never re-discloses secrets. To rotate, register
+a new subscription, let your receiver accept both secrets during the cutover,
+then `DELETE` the old one. If you lose the `management_token`, you can't delete
+the subscription yourself — keep returning `2xx` from your receiver (and ignore
+the events) so it doesn't burn retries, and ask the operator to remove the row.
+
+### Receiving deliveries in your backend
+
+The two rules every receiver must follow:
+
+1. **Verify over the raw request bytes** — parse JSON only *after* the HMAC
+   check. Body-parsing middleware that re-serializes will break the digest.
+2. **Acknowledge fast** — return `2xx` within 10s, then do your real work
+   (DB writes, notifications) asynchronously. A slow handler looks like a
+   failure and triggers a retry, which you'll then process twice.
+
+**Express:**
+
+```js
+import express from "express";
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const app = express();
+const SECRET = process.env.STRAIT_SIGNING_SECRET;
+
+// express.raw (NOT express.json) so we can verify the exact bytes.
+app.post("/strait-hook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.get("X-Strait-Signature") ?? "";
+  const expected = "sha256=" + createHmac("sha256", SECRET).update(req.body).digest("hex");
+  if (sig.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return res.status(401).send("bad signature");
+  }
+
+  res.status(200).send("ok"); // ack first — work after
+
+  const deliveryId = req.get("X-Strait-Delivery"); // your dedupe key
+  const { event, transfer } = JSON.parse(req.body);
+  if (event === "transfer.status_changed" && transfer.status === "FINALIZED") {
+    // e.g. mark the user's bridge as complete, send a push notification…
+  }
+});
+```
+
+**Next.js (App Router route handler):**
+
+```ts
+// app/api/strait-hook/route.ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+export async function POST(req: Request) {
+  const raw = Buffer.from(await req.arrayBuffer()); // raw bytes, not req.json()
+  const sig = req.headers.get("x-strait-signature") ?? "";
+  const expected = "sha256=" +
+    createHmac("sha256", process.env.STRAIT_SIGNING_SECRET!).update(raw).digest("hex");
+  if (sig.length !== expected.length ||
+      !timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+    return new Response("bad signature", { status: 401 });
+  }
+
+  const deliveryId = req.headers.get("x-strait-delivery"); // your dedupe key
+  const { event, transfer } = JSON.parse(raw.toString());
+  // handle the event (keep it quick, or hand off to a queue)…
+  return new Response("ok");
+}
+```
+
+### Recommended integration pattern (webhook + poll reconciliation)
+
+For a bridge UI or wallet backend tracking user transfers end-to-end:
+
+1. **On submit** — your user submits the bridge tx; you know its source tx
+   hash. Store a `pending` row in your own DB keyed by that hash.
+2. **On webhook** — verify the signature, dedupe on `X-Strait-Delivery`, match
+   `transfer.source_tx_hash` (or `transfer.id`) to your row, update its status,
+   notify the user. Subscribe with `statuses: ["FINALIZED", "FAILED"]` if
+   that's all you act on.
+3. **Reconcile** — webhooks are at-least-once, but if your endpoint is down
+   longer than the retry window (~1.5 days) a delivery can be permanently
+   failed. Run a periodic sweep (cron every ~10 min) over your still-`pending`
+   rows and resolve them by polling:
+
+```ts
+async function fetchByTxHash(txHash: string) {
+  const res = await fetch("http://localhost:8080/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      query: `query($q: String) {
+        searchTransfers(query: $q, limit: 1) {
+          id status route asset amount destTxHash finalizedAt
+        }
+      }`,
+      variables: { q: txHash },
+    }),
+  });
+  const { data } = await res.json();
+  return data?.searchTransfers?.[0] ?? null;
+}
+```
+
+The webhook gives you low latency; the sweep guarantees you never miss a
+terminal state. Both read the same records, so they can share handling code.

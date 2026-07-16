@@ -7,6 +7,7 @@ const NAV = [
   { id: "data", label: "The data" },
   { id: "lifecycle", label: "Lifecycle" },
   { id: "api", label: "Using the API" },
+  { id: "webhooks", label: "Webhooks" },
   { id: "contracts", label: "Contracts" },
 ];
 
@@ -22,6 +23,13 @@ const TOC = [
   { id: "api-endpoints", label: "Endpoints", level: 3 },
   { id: "api-graphql", label: "GraphQL queries", level: 3 },
   { id: "api-examples", label: "Examples", level: 3 },
+  { id: "webhooks", label: "Webhooks", level: 2 },
+  { id: "webhooks-register", label: "Registering", level: 3 },
+  { id: "webhooks-deliveries", label: "Deliveries", level: 3 },
+  { id: "webhooks-verify", label: "Verifying signatures", level: 3 },
+  { id: "webhooks-credentials", label: "Credentials & subscriptions", level: 3 },
+  { id: "webhooks-integrate", label: "Backend integration", level: 3 },
+  { id: "webhooks-manage", label: "Managing", level: 3 },
   { id: "contracts", label: "Contracts", level: 2 },
 ];
 

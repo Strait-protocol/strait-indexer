@@ -168,6 +168,14 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // Webhook dispatcher — drains the webhook_deliveries outbox that the store
+    // writer fills, POSTing HMAC-signed payloads to registered subscribers.
+    {
+        let db = db.clone();
+        tasks.spawn(async move {
+            strait_api::webhooks::dispatcher::run_dispatch_loop(db).await;
+        });
+    }
 
     info!(
         api = %format!("http://{}:{}", config.api.host, config.api.port),
@@ -260,6 +268,8 @@ fn build_provider(rpc_url: &str) -> anyhow::Result<Arc<dyn Provider>> {
 /// `StatusChanged` / `Retracted` update its status, and `PopAnchored` records the
 /// Bitcoin-finality fields.
 async fn store_writer(db: Database, mut rx: mpsc::Receiver<TunnelTransferUpdate>) {
+    use strait_api::webhooks::dispatcher::{self, event};
+
     info!("Store writer started");
     while let Some(update) = rx.recv().await {
         let repo = TunnelTransferRepo::new(&db);
@@ -301,6 +311,30 @@ async fn store_writer(db: Database, mut rx: mpsc::Receiver<TunnelTransferUpdate>
 
         if let Err(e) = result {
             error!("Store writer failed to persist update: {e}");
+            continue;
+        }
+
+        // Enqueue webhook deliveries for the persisted change (outbox insert
+        // only — the dispatcher task does the actual HTTP). Failures here are
+        // logged, never allowed to stall indexing.
+        let (transfer_id, event_type) = match &update {
+            TunnelTransferUpdate::Created(t) => (t.id, event::CREATED),
+            TunnelTransferUpdate::StatusChanged { id, .. } => (*id, event::STATUS_CHANGED),
+            TunnelTransferUpdate::PopAnchored { id, .. } => (*id, event::POP_ANCHORED),
+            TunnelTransferUpdate::Retracted { id, .. } => (*id, event::RETRACTED),
+            TunnelTransferUpdate::DestinationConfirmed { .. } => continue, // no write happened
+            TunnelTransferUpdate::EthWithdrawalFinalized { id, .. } => {
+                (*id, event::STATUS_CHANGED)
+            }
+        };
+        match repo.get(transfer_id).await {
+            Ok(Some(row)) => {
+                if let Err(e) = dispatcher::enqueue(&db, event_type, &row).await {
+                    error!(transfer = %transfer_id, "Webhook enqueue failed: {e}");
+                }
+            }
+            Ok(None) => {} // row vanished (shouldn't happen) — nothing to notify
+            Err(e) => error!(transfer = %transfer_id, "Webhook enqueue lookup failed: {e}"),
         }
     }
     info!("Store writer stopped — update channel closed");
