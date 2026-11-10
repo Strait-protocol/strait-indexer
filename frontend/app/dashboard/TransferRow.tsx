@@ -29,7 +29,7 @@ export default function TransferRow({ t, network }: { t: Transfer; network: Netw
           <span className="font-mono text-zinc-600">{t.id.slice(0, 8)}…</span>
         </div>
       </td>
-      <td className="px-4 py-3 tabular-nums text-zinc-200">{formatAmount(t.asset, t.amount)}</td>
+      <td className="px-4 py-3 tabular-nums text-zinc-200">{formatAmount(t)}</td>
       <td className="px-4 py-3">
         <span className={`inline-flex items-center gap-1.5 ${s.text}`}>
           <span className={`h-2 w-2 rounded-full ${s.dot}`} />

@@ -62,7 +62,7 @@ export default async function TransferDetailPage({
             <span className={`rounded border px-2 py-0.5 text-xs ${kind.cls}`}>{kind.label}</span>
           </div>
           <div className="mt-1 text-3xl font-semibold tabular-nums text-white">
-            {formatAmount(t.asset, t.amount)}
+            {formatAmount(t)}
           </div>
           <div className="mt-2 flex items-center gap-1.5 font-mono text-xs text-zinc-500">
             {t.id}
@@ -103,7 +103,7 @@ export default async function TransferDetailPage({
           <dl className="space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-5 py-4 text-sm">
             <Field label="Asset" value={t.asset} />
             <Field label="Direction" value={`${kind.label} (${kind.hint})`} />
-            <Field label="Amount" value={formatAmount(t.asset, t.amount)} mono />
+            <Field label="Amount" value={formatAmount(t)} mono />
             <Field label="Sender" value={shortHash(t.sender)} mono copyValue={t.sender} />
             <Field label="Recipient" value={shortHash(t.recipient)} mono copyValue={t.recipient} />
             <div className="h-px bg-white/[0.06]" />
@@ -123,6 +123,14 @@ export default async function TransferDetailPage({
               fee={t.destFee}
               network={network}
             />
+            {t.withdrawalHash && (
+              <Field
+                label="Withdrawal hash"
+                value={shortHash(t.withdrawalHash)}
+                mono
+                copyValue={t.withdrawalHash}
+              />
+            )}
             <div className="h-px bg-white/[0.06]" />
             <Field label="Initiated" value={timeAgo(t.initiatedAt)} />
             <Field label="Finalized" value={t.finalizedAt ? timeAgo(t.finalizedAt) : "—"} />
@@ -186,7 +194,7 @@ function buildTimeline(t: Transfer): Step[] {
         hash: null,
         block: null,
         done: proven,
-        detail: proven ? "1-day challenge window started" : "Submit proof on the Hemi bridge to begin",
+        detail: provenDetail(t, proven),
       },
       { title: "Released on Ethereum", chain: t.destChain, hash: t.destTxHash, block: t.destBlock, done: t.destTxHash != null },
       finalStep,
@@ -204,6 +212,21 @@ function buildTimeline(t: Transfer): Step[] {
     },
     finalStep,
   ];
+}
+
+/** Hemi's OP Stack challenge window (L2OutputOracle finalization period). */
+const CHALLENGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function provenDetail(t: Transfer, proven: boolean): string {
+  if (!proven) return "Submit proof on the Hemi bridge to begin";
+  if (!t.provenAt) return "1-day challenge window started";
+  const claimable = new Date(new Date(t.provenAt).getTime() + CHALLENGE_WINDOW_MS);
+  const when = claimable.toLocaleString("en-US", {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC",
+  });
+  return t.status === "PROVING" && claimable.getTime() > Date.now()
+    ? `proven ${timeAgo(t.provenAt)} · claimable ~${when} UTC`
+    : `proven ${timeAgo(t.provenAt)}`;
 }
 
 function TimelineStep({ step, last, network }: { step: Step; last: boolean; network: Network }) {

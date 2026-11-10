@@ -973,12 +973,8 @@ impl EvmIngester {
     /// Handle WithdrawalProven — `proveWithdrawalTransaction` was called on OptimismPortal,
     /// starting the 1-day OP Stack challenge window for a HEMI_TO_ETH withdrawal.
     ///
-    /// Emits a `WithdrawalProven` event to the channel and directly advances the
-    /// matching DB transfer from INITIATED → PROVING.
-    ///
-    /// `WithdrawalProven` carries no amount, so matching is by `to` (recipient) address
-    /// only — FIFO ordering (oldest INITIATED first) handles same-user concurrent
-    /// withdrawals correctly.
+    /// Emits a `WithdrawalProven` event to the channel. The transfer status itself
+    /// is advanced by `EthWithdrawalReconciler` in strait-node.
     async fn handle_withdrawal_proven(
         &self,
         withdrawal_hash: TxHash,
@@ -1008,29 +1004,11 @@ impl EvmIngester {
         self.event_tx.send(event).await
             .map_err(|e| StraitError::Internal(format!("Failed to send event: {}", e)))?;
 
-        // DB-backed advance: find the oldest INITIATED HEMI_TO_ETH withdrawal for
-        // this recipient and advance it to PROVING.
-        let recipient = format!("0x{}", hex::encode(to.0));
-        let repo = TunnelTransferRepo::new(&self.db);
-        match repo.find_eth_withdrawal_for_proving(&recipient).await {
-            Ok(Some(transfer)) => {
-                match repo.set_eth_withdrawal_proving(transfer.id, block_time).await {
-                    Ok(()) => info!(
-                        transfer_id = %transfer.id,
-                        block = block_num,
-                        "HEMI_TO_ETH withdrawal INITIATED → PROVING (challenge window open)"
-                    ),
-                    Err(e) => warn!(error = %e, "DB proving write failed for ETH withdrawal"),
-                }
-            }
-            Ok(None) => {
-                debug!(
-                    recipient = %recipient,
-                    "WithdrawalProven: no INITIATED HEMI_TO_ETH withdrawal found in DB"
-                );
-            }
-            Err(e) => warn!(error = %e, "DB lookup failed for withdrawal proving"),
-        }
+        // No DB write here. The event's `to` is the L1CrossDomainMessenger for every
+        // standard-bridge withdrawal, never the end user, so it can't identify a
+        // transfer. The INITIATED → PROVING advance is owned by the withdrawal
+        // reconciler in strait-node, which matches on `withdrawal_hash` and also
+        // fires the status-change webhook.
 
         Ok(())
     }

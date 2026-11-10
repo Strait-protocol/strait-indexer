@@ -11,7 +11,7 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use strait_core::error::{Result, StraitError};
-use strait_core::types::{TunnelStatus, TunnelTransfer};
+use strait_core::types::{Asset, TunnelStatus, TunnelTransfer};
 
 use crate::db::Database;
 
@@ -45,6 +45,16 @@ pub struct TunnelTransferRow {
     /// BTC withdrawal uuid, used to match the Bitcoin payout by its OP_RETURN.
     pub withdrawal_uuid: Option<i64>,
 
+    /// ERC-20 decimals resolved on-chain at ingest (NULL for BTC/ETH and for rows
+    /// written before migration 010 — use `asset_decimals()` for a resolved value).
+    pub asset_decimals: Option<i16>,
+    /// ERC-20 contract address on the chain the event was observed on.
+    pub asset_contract: Option<String>,
+    /// HEMI_TO_ETH only: OP Stack withdrawal hash from the Hemi `MessagePassed` log.
+    pub withdrawal_hash: Option<String>,
+    /// HEMI_TO_ETH only: when the withdrawal was proven on L1 (challenge window start).
+    pub proven_at: Option<DateTime<Utc>>,
+
     pub pop_anchored: bool,
     pub pop_keystone_block: Option<i64>,
     pub pop_score: Option<i64>,
@@ -56,6 +66,16 @@ pub struct TunnelTransferRow {
     pub updated_at: DateTime<Utc>,
 }
 
+impl TunnelTransferRow {
+    /// Decimals of `amount`: the value resolved on-chain at ingest when stored,
+    /// else the known-symbol table. `None` means genuinely unknown.
+    pub fn resolved_asset_decimals(&self) -> Option<u8> {
+        self.asset_decimals
+            .and_then(|d| u8::try_from(d).ok())
+            .or_else(|| strait_core::types::known_decimals(&self.asset))
+    }
+}
+
 /// One time-bucketed row from `analytics_series`: transfer count and total
 /// volume for a given route/asset within a `date_trunc`'d window.
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -63,6 +83,8 @@ pub struct AnalyticsBucketRow {
     pub bucket_start: DateTime<Utc>,
     pub route: String,
     pub asset: String,
+    /// Stored on-chain decimals for this asset, if any row in the bucket has them.
+    pub asset_decimals: Option<i16>,
     pub transfer_count: i64,
     pub volume: BigDecimal,
 }
@@ -90,6 +112,12 @@ impl<'a> TunnelTransferRepo<'a> {
             ),
             None => (None, None, None),
         };
+        let (asset_decimals, asset_contract) = match &t.asset {
+            Asset::Erc20 { contract, decimals, .. } => {
+                (Some(*decimals as i16), Some(contract.to_string()))
+            }
+            Asset::Btc | Asset::Eth => (None, None),
+        };
 
         sqlx::query(
             r#"
@@ -99,9 +127,10 @@ impl<'a> TunnelTransferRepo<'a> {
                 dest_chain, dest_tx_hash, dest_block,
                 pop_anchored, pop_keystone_block, pop_score, pop_anchored_at,
                 initiated_at, finalized_at,
-                source_fee, dest_fee, withdrawal_uuid
+                source_fee, dest_fee, withdrawal_uuid,
+                asset_decimals, asset_contract
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
             ON CONFLICT (id) DO UPDATE SET
                 -- Never let a late INITIATED event regress an advanced status —
                 -- except a REORGED row, which a re-observed event revives (the
@@ -130,6 +159,8 @@ impl<'a> TunnelTransferRepo<'a> {
                 source_fee         = COALESCE(EXCLUDED.source_fee, tunnel_transfers.source_fee),
                 dest_fee           = COALESCE(EXCLUDED.dest_fee, tunnel_transfers.dest_fee),
                 withdrawal_uuid    = COALESCE(EXCLUDED.withdrawal_uuid, tunnel_transfers.withdrawal_uuid),
+                asset_decimals     = COALESCE(EXCLUDED.asset_decimals, tunnel_transfers.asset_decimals),
+                asset_contract     = COALESCE(EXCLUDED.asset_contract, tunnel_transfers.asset_contract),
                 updated_at         = NOW()
             "#,
         )
@@ -157,6 +188,8 @@ impl<'a> TunnelTransferRepo<'a> {
         .bind(t.source_fee.clone())
         .bind(t.dest_fee.clone())
         .bind(t.withdrawal_uuid.map(|v| v as i64))
+        .bind(asset_decimals)
+        .bind(asset_contract)
         .execute(self.pool)
         .await
         .map_err(StraitError::Database)?;
@@ -213,42 +246,70 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
-    /// Find the oldest INITIATED HEMI_TO_ETH withdrawal for a recipient address —
-    /// used when `WithdrawalProven` fires to advance the transfer to PROVING.
-    ///
-    /// `WithdrawalProven` carries no amount, so matching is by recipient only.
-    /// FIFO ordering (ASC by initiated_at) handles same-user concurrent withdrawals.
-    pub async fn find_eth_withdrawal_for_proving(
-        &self,
-        recipient: &str,
-    ) -> Result<Option<TunnelTransferRow>> {
-        let row = sqlx::query_as::<_, TunnelTransferRow>(
+    /// Pending Hemi→ETH withdrawals whose OP Stack withdrawal hash hasn't been
+    /// recorded yet — the reconciler fills these from the Hemi tx receipt.
+    pub async fn eth_withdrawals_missing_hash(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {
+        sqlx::query_as::<_, TunnelTransferRow>(
+            "SELECT * FROM tunnel_transfers
+             WHERE route = 'HEMI_TO_ETH'
+               AND status IN ('INITIATED', 'PROVING')
+               AND withdrawal_hash IS NULL
+             ORDER BY initiated_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+        .map_err(StraitError::Database)
+    }
+
+    /// Record a transfer's OP Stack withdrawal hash (lowercase 0x-hex).
+    pub async fn set_withdrawal_hash(&self, id: Uuid, withdrawal_hash: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE tunnel_transfers
+             SET withdrawal_hash = $2, updated_at = NOW()
+             WHERE id = $1 AND withdrawal_hash IS NULL",
+        )
+        .bind(id)
+        .bind(withdrawal_hash)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
+    /// INITIATED Hemi→ETH withdrawals with a known withdrawal hash — candidates
+    /// for a `provenWithdrawals` check on the L1 OptimismPortal.
+    pub async fn eth_withdrawals_awaiting_proof(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {
+        sqlx::query_as::<_, TunnelTransferRow>(
             "SELECT * FROM tunnel_transfers
              WHERE route = 'HEMI_TO_ETH'
                AND status = 'INITIATED'
-               AND lower(recipient) = lower($1)
-             ORDER BY initiated_at ASC
-             LIMIT 1",
+               AND withdrawal_hash IS NOT NULL
+             ORDER BY initiated_at DESC
+             LIMIT $1",
         )
-        .bind(recipient)
-        .fetch_optional(self.pool)
+        .bind(limit)
+        .fetch_all(self.pool)
         .await
-        .map_err(StraitError::Database)?;
-        Ok(row)
+        .map_err(StraitError::Database)
     }
 
     /// Advance a HEMI_TO_ETH withdrawal to PROVING once its withdrawal has been
     /// proven on the OptimismPortal (1-day challenge window now open).
-    /// The `WHERE status = 'INITIATED'` guard makes this idempotent.
+    ///
+    /// The `status = 'INITIATED'` guard makes this idempotent and keeps it from
+    /// regressing a withdrawal that already FINALIZED. Returns whether a row moved.
     pub async fn set_eth_withdrawal_proving(
         &self,
         id: Uuid,
         proven_at: DateTime<Utc>,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let res = sqlx::query(
             "UPDATE tunnel_transfers
              SET status     = 'PROVING',
-                 updated_at = $2
+                 proven_at  = $2,
+                 updated_at = NOW()
              WHERE id = $1
                AND status = 'INITIATED'",
         )
@@ -257,7 +318,7 @@ impl<'a> TunnelTransferRepo<'a> {
         .execute(self.pool)
         .await
         .map_err(StraitError::Database)?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// Find a Hemi→ETH withdrawal in INITIATED or PROVING status matching the
@@ -628,6 +689,7 @@ impl<'a> TunnelTransferRepo<'a> {
                 date_trunc($1, initiated_at) AS bucket_start,
                 route,
                 asset,
+                MAX(asset_decimals) AS asset_decimals,
                 COUNT(*)::bigint AS transfer_count,
                 SUM(amount)      AS volume
              FROM tunnel_transfers

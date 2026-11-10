@@ -46,6 +46,9 @@ export type Transfer = {
   direction: string;
   route: string;
   amount: string;
+  /** Decimals of `amount`; null only for an ERC-20 the indexer couldn't resolve. */
+  assetDecimals: number | null;
+  assetContract: string | null;
   /** For BTC_TO_HEMI this is always `btctx:<txid>`, never a real Bitcoin address —
    *  Bitcoin's UTXO model has no single unambiguous sender. Permanent, not a
    *  placeholder awaiting enrichment. See docs/api-integration.md §6. */
@@ -61,6 +64,10 @@ export type Transfer = {
   destBlock: number | null;
   sourceFee: string | null;
   destFee: string | null;
+  /** HEMI_TO_ETH only: OP Stack withdrawal hash (key on the L1 OptimismPortal). */
+  withdrawalHash: string | null;
+  /** HEMI_TO_ETH only: when the withdrawal was proven on L1 (challenge window start). */
+  provenAt: string | null;
   popAnchored: boolean;
   popKeystoneBlock: number | null;
   popScore: number | null;
@@ -81,10 +88,10 @@ export type Stats = {
 };
 
 const TRANSFER_FIELDS = `
-  id asset direction route amount sender recipient status
+  id asset assetDecimals assetContract direction route amount sender recipient status
   sourceChain sourceTxHash sourceBlock sourceTimestamp
   destChain destTxHash destBlock
-  sourceFee destFee
+  sourceFee destFee withdrawalHash provenAt
   popAnchored popKeystoneBlock popScore popAnchoredAt
   initiatedAt finalizedAt
 `;
@@ -223,34 +230,49 @@ export function routeLabel(route: string): string {
   return map[route] ?? route;
 }
 
-/** Known gap: `tunnel_transfers` only stores the resolved ERC-20 *symbol*, not its
- *  decimals (see docs/api-integration.md §5 and docs/tunnel-architecture.md
- *  "Asset resolution") — so this assumes 18 for anything that isn't BTC. That's
- *  correct for ETH and for tokens re-deployed on Hemi with 18 decimals (HEMI,
- *  VUSD, XAUt as of writing), but would misformat a bridged token whose Hemi-side
- *  contract uses a different decimals count (many wrapped-BTC tokens use 8 on
- *  their home chain — verify before trusting this for a new asset). */
-function decimalsFor(asset: string): number {
-  if (asset === "BTC") return 8;
-  return 18; // ETH and ERC-20 default
+/** Decimals by symbol, read from the Hemi mainnet token contracts (Nov 2026).
+ *  Only a fallback: the API returns `assetDecimals` resolved on-chain at ingest.
+ *  Mirrors `known_decimals` in strait-core. */
+const KNOWN_DECIMALS: Record<string, number> = {
+  BTC: 8, hemiBTC: 8, cbBTC: 8, WBTC: 8,
+  USDC: 6, "USDC.e": 6, USDT: 6, XAUt: 6,
+  ETH: 18, WETH: 18, HEMI: 18, VUSD: 18, tBTC: 18, DAI: 18,
+};
+
+function decimalsFor(asset: string, decimals?: number | null): number {
+  if (decimals != null) return decimals;
+  return KNOWN_DECIMALS[asset] ?? 18;
 }
 
-/** Format an atomic-unit amount string into a human value with its asset. */
-export function formatAmount(asset: string, amount: string): string {
-  const decimals = decimalsFor(asset);
+/** Format an atomic-unit amount into a human value with its asset.
+ *  Values ≥ 1 keep up to 6 fractional digits; values < 1 keep 6 significant
+ *  digits, so a dust-sized amount never collapses to "0". */
+export function formatAmount(
+  t: { asset: string; amount: string; assetDecimals?: number | null },
+): string {
+  const { asset, amount } = t;
+  const decimals = decimalsFor(asset, t.assetDecimals);
   let v: bigint;
   try {
     v = BigInt(amount);
   } catch {
     return `${amount} ${asset}`;
   }
+  const neg = v < BigInt(0);
+  if (neg) v = -v;
   const base = BigInt(10) ** BigInt(decimals);
   const whole = v / base;
   const frac = v % base;
-  if (frac === BigInt(0)) return `${whole} ${asset}`;
-  // up to 6 significant fractional digits, trimmed
-  let fracStr = frac.toString().padStart(decimals, "0").slice(0, 6).replace(/0+$/, "");
-  return fracStr ? `${whole}.${fracStr} ${asset}` : `${whole} ${asset}`;
+  let fracStr = frac.toString().padStart(decimals, "0");
+  if (whole === BigInt(0) && frac !== BigInt(0)) {
+    const firstSig = fracStr.search(/[1-9]/);
+    fracStr = fracStr.slice(0, firstSig + 6);
+  } else {
+    fracStr = fracStr.slice(0, 6);
+  }
+  fracStr = fracStr.replace(/0+$/, "");
+  const wholeStr = whole.toLocaleString("en-US");
+  return `${neg ? "-" : ""}${fracStr ? `${wholeStr}.${fracStr}` : wholeStr} ${asset}`;
 }
 
 export function shortHash(hash: string | null | undefined, lead = 8, tail = 6): string {

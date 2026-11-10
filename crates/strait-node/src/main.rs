@@ -14,6 +14,7 @@
 //!                          HTTP API (axum) ── /health, /transfers
 //! ```
 
+mod eth_withdrawal_reconciler;
 mod payout_watcher;
 
 use std::sync::Arc;
@@ -82,6 +83,30 @@ async fn main() -> anyhow::Result<()> {
         Some(url) => build_provider(url).context("invalid HEMI_PAYOUT_KIT_RPC_URL")?,
         None => bitcoin_kit_provider.clone(),
     };
+    // Hemi→ETH withdrawal reconciler (INITIATED → PROVING). Needs the L1
+    // OptimismPortal address; without it the PROVING stage is never tracked.
+    let withdrawal_reconciler = match config
+        .ethereum
+        .opt_portal_contract
+        .as_deref()
+        .map(|s| s.parse::<alloy::primitives::Address>())
+    {
+        Some(Ok(portal)) => Some(eth_withdrawal_reconciler::EthWithdrawalReconciler::new(
+            hemi_provider.clone(),
+            eth_provider.clone(),
+            portal,
+            db.clone(),
+            std::time::Duration::from_secs(60),
+        )),
+        Some(Err(e)) => {
+            error!("invalid ETH_OPT_PORTAL_CONTRACT ({e}) — Hemi→ETH PROVING tracking disabled");
+            None
+        }
+        None => {
+            warn!("ETH_OPT_PORTAL_CONTRACT not set — Hemi→ETH PROVING tracking disabled");
+            None
+        }
+    };
     let hemi_ingester = EvmIngester::new(
         config.hemi.clone(),
         Chain::Hemi,
@@ -145,6 +170,13 @@ async fn main() -> anyhow::Result<()> {
             let watcher = payout_watcher::BtcPayoutWatcher::new(caller, payout_kit_provider, db, interval, confs, vault_contracts);
             if let Err(e) = watcher.run().await {
                 error!("BTC payout watcher exited: {e}");
+            }
+        });
+    }
+    if let Some(reconciler) = withdrawal_reconciler {
+        tasks.spawn(async move {
+            if let Err(e) = reconciler.run().await {
+                error!("Hemi→ETH withdrawal reconciler exited: {e}");
             }
         });
     }
