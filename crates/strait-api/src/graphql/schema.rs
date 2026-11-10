@@ -24,9 +24,14 @@ pub struct Transfer {
     pub route: String,
     /// Amount in atomic units (satoshis or wei), as a plain decimal string.
     pub amount: String,
+    /// Decimals of `amount` (8 for BTC, 18 for ETH, the token's own for ERC-20s).
+    /// Null only for an ERC-20 whose decimals are unknown.
+    pub asset_decimals: Option<i32>,
+    /// ERC-20 contract address on the chain the event was observed on, or null.
+    pub asset_contract: Option<String>,
     pub sender: String,
     pub recipient: String,
-    /// INITIATED | ANCHORED | FINALIZED | FAILED | REORGED.
+    /// INITIATED | ANCHORED | PROVING | FINALIZED | FAILED | REORGED.
     pub status: String,
 
     pub source_chain: String,
@@ -43,6 +48,13 @@ pub struct Transfer {
     /// Network fee on the destination leg, atomic units (wei or sats) as a string, or null.
     pub dest_fee: Option<String>,
 
+    /// HEMI_TO_ETH only: OP Stack withdrawal hash (from the Hemi `MessagePassed`
+    /// log) — the key the L1 OptimismPortal tracks this withdrawal by.
+    pub withdrawal_hash: Option<String>,
+    /// HEMI_TO_ETH only: when the withdrawal was proven on L1. The challenge window
+    /// runs from here; after it, the withdrawal can be finalized.
+    pub proven_at: Option<DateTime<Utc>>,
+
     /// Whether this transfer has been PoP-anchored to Bitcoin.
     pub pop_anchored: bool,
     /// The Hemi keystone block (multiple of 25) that anchored it.
@@ -57,7 +69,12 @@ pub struct Transfer {
 
 impl From<TunnelTransferRow> for Transfer {
     fn from(r: TunnelTransferRow) -> Self {
+        let asset_decimals = r.resolved_asset_decimals().map(i32::from);
         Self {
+            asset_decimals,
+            asset_contract: r.asset_contract,
+            withdrawal_hash: r.withdrawal_hash,
+            proven_at: r.proven_at,
             id: r.id,
             asset: r.asset,
             direction: r.direction,
@@ -164,6 +181,8 @@ pub struct AnalyticsBucket {
     pub bucket_start: DateTime<Utc>,
     pub route: String,
     pub asset: String,
+    /// Decimals of `volume` for this asset; null if unknown.
+    pub asset_decimals: Option<i32>,
     pub transfer_count: i64,
     pub volume: String,
 }
@@ -173,6 +192,10 @@ impl From<AnalyticsBucketRow> for AnalyticsBucket {
         Self {
             bucket_start: r.bucket_start,
             route: r.route,
+            asset_decimals: r
+                .asset_decimals
+                .map(i32::from)
+                .or_else(|| strait_core::types::known_decimals(&r.asset).map(i32::from)),
             asset: r.asset,
             transfer_count: r.transfer_count,
             volume: r.volume.with_scale(0).to_string(),

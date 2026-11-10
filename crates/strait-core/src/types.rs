@@ -360,6 +360,31 @@ impl fmt::Display for Asset {
     }
 }
 
+impl Asset {
+    /// Decimals of the asset's atomic unit (sats for BTC, wei for ETH, the token's
+    /// own `decimals()` for ERC-20s).
+    pub fn decimals(&self) -> u8 {
+        match self {
+            Self::Btc => 8,
+            Self::Eth => 18,
+            Self::Erc20 { decimals, .. } => *decimals,
+        }
+    }
+}
+
+/// Decimals for an asset known only by its symbol — used for rows persisted
+/// before decimals were stored (migration 010). Values read from the Hemi mainnet
+/// token contracts (Nov 2026). `None` for symbols not in the table: callers must
+/// not silently assume 18 for an unknown token.
+pub fn known_decimals(symbol: &str) -> Option<u8> {
+    match symbol {
+        "BTC" | "hemiBTC" | "cbBTC" | "WBTC" => Some(8),
+        "USDC" | "USDC.e" | "USDT" | "XAUt" => Some(6),
+        "ETH" | "WETH" | "HEMI" | "VUSD" | "tBTC" | "DAI" => Some(18),
+        _ => None,
+    }
+}
+
 /// Chain-specific address (EVM or Bitcoin)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "chain")]

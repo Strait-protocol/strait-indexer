@@ -240,7 +240,9 @@ sol! {
 //   1. proveWithdrawalTransaction  → emits WithdrawalProven  → 1-day challenge window
 //   2. finalizeWithdrawalTransaction → emits ETHBridgeFinalized on L1StandardBridge
 //
-// Strait watches WithdrawalProven to advance HEMI_TO_ETH withdrawals INITIATED → PROVING.
+// HEMI_TO_ETH INITIATED → PROVING is driven by strait-node's EthWithdrawalReconciler,
+// which reads `provenWithdrawals(withdrawalHash)`. WithdrawalProven's `to` is always
+// the L1CrossDomainMessenger, so the event alone can't identify the user's transfer.
 // ETHBridgeFinalized (already watched on L1StandardBridge) advances PROVING → FINALIZED.
 // ============================================================================
 
@@ -256,6 +258,41 @@ sol! {
 
         /// Emitted when finalizeWithdrawalTransaction is called (after the window).
         event WithdrawalFinalized(bytes32 indexed withdrawalHash, bool success);
+
+        /// Legacy (L2OutputOracle) portal, v2.x — what Hemi mainnet and Sepolia run
+        /// (`version()` = "2.5.0", Nov 2026). `timestamp` is 0 if never proven.
+        function provenWithdrawals(bytes32 withdrawalHash) external view returns (
+            bytes32 outputRoot,
+            uint128 timestamp,
+            uint128 l2OutputIndex
+        );
+
+        function finalizedWithdrawals(bytes32 withdrawalHash) external view returns (bool);
+    }
+}
+
+// ============================================================================
+// L2ToL1MessagePasser predeploy (0x4200000000000000000000000000000000000016)
+//
+// Every OP Stack withdrawal goes through `initiateWithdrawal`, which emits
+// MessagePassed in the same Hemi tx as the bridge's ETH/ERC20BridgeInitiated.
+// `withdrawalHash` is the key the L1 OptimismPortal proves and finalizes by.
+// ============================================================================
+
+/// L2ToL1MessagePasser predeploy address (same on every OP Stack chain).
+pub const L2_TO_L1_MESSAGE_PASSER: &str = "0x4200000000000000000000000000000000000016";
+
+sol! {
+    interface IL2ToL1MessagePasser {
+        event MessagePassed(
+            uint256 indexed nonce,
+            address indexed sender,
+            address indexed target,
+            uint256 value,
+            uint256 gasLimit,
+            bytes data,
+            bytes32 withdrawalHash
+        );
     }
 }
 
