@@ -54,6 +54,9 @@ pub struct TunnelTransferRow {
     pub withdrawal_hash: Option<String>,
     /// HEMI_TO_ETH only: when the withdrawal was proven on L1 (challenge window start).
     pub proven_at: Option<DateTime<Utc>>,
+    /// When the withdrawal reconciler last checked this row against L1.
+    #[serde(skip)]
+    pub reconciled_at: Option<DateTime<Utc>>,
 
     pub pop_anchored: bool,
     pub pop_keystone_block: Option<i64>,
@@ -278,21 +281,71 @@ impl<'a> TunnelTransferRepo<'a> {
         Ok(())
     }
 
-    /// INITIATED Hemi→ETH withdrawals with a known withdrawal hash — candidates
-    /// for a `provenWithdrawals` check on the L1 OptimismPortal.
-    pub async fn eth_withdrawals_awaiting_proof(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {
+    /// Pending (INITIATED / PROVING) Hemi→ETH withdrawals with a known withdrawal
+    /// hash, least-recently-reconciled first, so every row is revisited even when
+    /// the backlog exceeds one batch.
+    pub async fn eth_withdrawals_to_reconcile(&self, limit: i64) -> Result<Vec<TunnelTransferRow>> {
         sqlx::query_as::<_, TunnelTransferRow>(
             "SELECT * FROM tunnel_transfers
              WHERE route = 'HEMI_TO_ETH'
-               AND status = 'INITIATED'
+               AND status IN ('INITIATED', 'PROVING')
                AND withdrawal_hash IS NOT NULL
-             ORDER BY initiated_at DESC
+             ORDER BY reconciled_at ASC NULLS FIRST, initiated_at DESC
              LIMIT $1",
         )
         .bind(limit)
         .fetch_all(self.pool)
         .await
         .map_err(StraitError::Database)
+    }
+
+    /// Stamp a withdrawal as just checked by the reconciler (rotation cursor —
+    /// deliberately leaves `updated_at` alone, nothing about the transfer changed).
+    pub async fn touch_reconciled(&self, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE tunnel_transfers SET reconciled_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(self.pool)
+            .await
+            .map_err(StraitError::Database)?;
+        Ok(())
+    }
+
+    /// Settle a pending Hemi→ETH withdrawal from its L1 `WithdrawalFinalized`
+    /// event, matched exactly by withdrawal hash. `success = false` (the portal's
+    /// relay call reverted — not retryable) marks it FAILED. Guarded on a pending
+    /// status so it never overwrites a row another path already settled.
+    /// Returns whether a row changed.
+    pub async fn settle_eth_withdrawal(
+        &self,
+        id: Uuid,
+        success: bool,
+        dest_tx_hash: &str,
+        dest_block: i64,
+        dest_fee: Option<BigDecimal>,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE tunnel_transfers
+             SET status       = CASE WHEN $2 THEN 'FINALIZED' ELSE 'FAILED' END,
+                 dest_chain   = 'ETHEREUM',
+                 dest_tx_hash = $3,
+                 dest_block   = $4,
+                 dest_fee     = COALESCE($5, dest_fee),
+                 finalized_at = $6,
+                 updated_at   = NOW()
+             WHERE id = $1
+               AND status IN ('INITIATED', 'PROVING')",
+        )
+        .bind(id)
+        .bind(success)
+        .bind(dest_tx_hash)
+        .bind(dest_block)
+        .bind(dest_fee)
+        .bind(finalized_at)
+        .execute(self.pool)
+        .await
+        .map_err(StraitError::Database)?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Advance a HEMI_TO_ETH withdrawal to PROVING once its withdrawal has been
