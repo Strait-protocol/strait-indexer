@@ -13,6 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
+  // Absolute base for Open Graph / Twitter card URLs, so shared links resolve to
+  // the canonical domain rather than a *.vercel.app deployment URL.
+  metadataBase: new URL("https://straitprotocol.com"),
   title: "Strait — Real-Time Tunnel Indexer for Hemi",
   description:
     "Strait indexes every asset moving through Hemi's Bitcoin and Ethereum tunnels. Real-time, reorg-safe, unified GraphQL API and webhooks.",
