@@ -651,7 +651,7 @@ function BuiltOnStrait() {
       status: 'Live',
       desc: 'Volume, TVL, route utilization, average finality time, and flow charts — Dune-style dashboards built straight off the indexed tunnel data.',
       cta: 'Open Analytics',
-      href: 'https://strait-analytics.vercel.app/',
+      href: 'https://analytics.straitprotocol.com/',
       external: true,
     },
     {

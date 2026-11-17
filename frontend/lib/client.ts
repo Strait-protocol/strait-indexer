@@ -6,4 +6,4 @@
 // user, never through the Next.js server.
 
 export const PUBLIC_API_URL =
-  process.env.NEXT_PUBLIC_STRAIT_API_URL ?? "https://strait-indexer.onrender.com";
+  process.env.NEXT_PUBLIC_STRAIT_API_URL ?? "https://api.straitprotocol.com";

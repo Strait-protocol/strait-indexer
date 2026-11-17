@@ -14,7 +14,10 @@ app that needs to know the state of a tunnel transfer.
 
 ## 1. Base URL & endpoints
 
-The node serves the API on `API_HOST:API_PORT` (default `0.0.0.0:8080`).
+**Hosted API:** `https://api.straitprotocol.com` (Hemi mainnet). All examples below use it.
+
+Self-hosting? The node serves the API on `API_HOST:API_PORT` (default `0.0.0.0:8080`).
+Swap `https://api.straitprotocol.com` for `http://localhost:8080` in the examples.
 
 | Method & path | Interface | Purpose |
 |---|---|---|
@@ -29,8 +32,8 @@ The node serves the API on `API_HOST:API_PORT` (default `0.0.0.0:8080`).
 | `GET  /webhooks/:id/deliveries` | REST | Last 20 delivery attempts (`X-Management-Token`) |
 | `DELETE /webhooks/:id` | REST | Remove a subscription (`X-Management-Token`) |
 
-> Open `http://<host>:8080/graphql` in a browser to explore the schema interactively
-> with GraphiQL.
+> Open [`https://api.straitprotocol.com/graphql`](https://api.straitprotocol.com/graphql)
+> in a browser to explore the schema interactively with GraphiQL.
 
 ---
 
@@ -152,10 +155,10 @@ All list queries accept `limit` (1–500, default 50) and `offset` (default 0).
 
 ```bash
 # List
-curl 'http://localhost:8080/transfers?limit=20&offset=0'
+curl 'https://api.straitprotocol.com/transfers?limit=20&offset=0'
 
 # One transfer
-curl 'http://localhost:8080/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'
+curl 'https://api.straitprotocol.com/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'
 ```
 
 REST responses wrap the payload: `{ "transfers": [...], "limit": 20, "offset": 0 }`
@@ -252,7 +255,7 @@ A new transfer typically appears within seconds of finality on the source chain
 
 ```ts
 async function transfersFor(recipient: string) {
-  const res = await fetch("http://localhost:8080/graphql", {
+  const res = await fetch("https://api.straitprotocol.com/graphql", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -273,7 +276,7 @@ async function transfersFor(recipient: string) {
 
 ```python
 import requests
-r = requests.get("http://localhost:8080/transfers", params={"limit": 20})
+r = requests.get("https://api.straitprotocol.com/transfers", params={"limit": 20})
 for t in r.json()["transfers"]:
     print(t["route"], t["status"], t["amount"], t["recipient"])
 ```
@@ -281,7 +284,7 @@ for t in r.json()["transfers"]:
 ### curl (GraphQL)
 
 ```bash
-curl -s http://localhost:8080/graphql \
+curl -s https://api.straitprotocol.com/graphql \
   -H 'content-type: application/json' \
   --data '{"query":"{ stats { totalTransfers } }"}'
 ```
@@ -311,7 +314,7 @@ the `X-Strait-Delivery` header if a replay would hurt you.
 ### Registering
 
 ```bash
-curl -X POST http://localhost:8080/webhooks \
+curl -X POST https://api.straitprotocol.com/webhooks \
   -H 'content-type: application/json' \
   -d '{
     "url": "https://example.com/strait-hook",
@@ -353,7 +356,7 @@ To debug your receiver, list the last 20 attempts (event, status, attempt count,
 response time in ms, last error):
 
 ```bash
-curl http://localhost:8080/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
+curl https://api.straitprotocol.com/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
 ```
 
 The explorer's **/webhooks** page does the same in a browser — register,
@@ -511,7 +514,7 @@ For a bridge UI or wallet backend tracking user transfers end-to-end:
 
 ```ts
 async function fetchByTxHash(txHash: string) {
-  const res = await fetch("http://localhost:8080/graphql", {
+  const res = await fetch("https://api.straitprotocol.com/graphql", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({

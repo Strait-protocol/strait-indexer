@@ -281,8 +281,13 @@ function UsingTheApi() {
   return (
     <Section id="api" title="Using the API">
       <p>
-        The node serves on <Code>API_HOST:API_PORT</Code> (default <Code>:8080</Code>). Open{" "}
-        <Code>/graphql</Code> in a browser for the interactive GraphiQL playground.
+        The hosted API is at <Code>https://api.straitprotocol.com</Code> (Hemi mainnet), and every
+        example below uses it. Open <Code>/graphql</Code> in a browser for the interactive GraphiQL
+        playground.
+      </p>
+      <p>
+        Self-hosting? The node serves on <Code>API_HOST:API_PORT</Code> (default{" "}
+        <Code>:8080</Code>). Swap in <Code>http://localhost:8080</Code> for the examples.
       </p>
 
       <h3 id="api-endpoints" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Endpoints</h3>
@@ -337,7 +342,7 @@ function UsingTheApi() {
 
       <h3 id="api-examples" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Examples</h3>
       <Pre>{`// TypeScript — search via GraphQL
-const res = await fetch("http://localhost:8080/graphql", {
+const res = await fetch("https://api.straitprotocol.com/graphql", {
   method: "POST",
   headers: { "content-type": "application/json" },
   body: JSON.stringify({
@@ -347,8 +352,8 @@ const res = await fetch("http://localhost:8080/graphql", {
 });
 const { data } = await res.json();`}</Pre>
       <Pre>{`# curl — REST
-curl 'http://localhost:8080/transfers?limit=20'
-curl 'http://localhost:8080/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'`}</Pre>
+curl 'https://api.straitprotocol.com/transfers?limit=20'
+curl 'https://api.straitprotocol.com/transfers/a2ce3b2d-7110-520c-8999-d21d1f88d1e5'`}</Pre>
 
       <Callout>
         <strong>Watching for finality:</strong> prefer a{" "}
@@ -379,7 +384,7 @@ function Webhooks() {
       </p>
 
       <h3 id="webhooks-register" className="text-lg font-semibold text-white pt-2 scroll-mt-24">Registering</h3>
-      <Pre>{`curl -X POST http://localhost:8080/webhooks \\
+      <Pre>{`curl -X POST https://api.straitprotocol.com/webhooks \\
   -H 'content-type: application/json' \\
   -d '{
     "url": "https://example.com/strait-hook",
@@ -543,7 +548,7 @@ export async function POST(req: Request) {
         sweep your still-pending rows every ~10 minutes and resolve them by polling:
       </p>
       <Pre>{`async function fetchByTxHash(txHash) {
-  const res = await fetch("http://localhost:8080/graphql", {
+  const res = await fetch("https://api.straitprotocol.com/graphql", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -573,13 +578,13 @@ export async function POST(req: Request) {
         same operations over curl:
       </p>
       <Pre>{`# Inspect (metadata only — secrets are never returned)
-curl http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'
+curl https://api.straitprotocol.com/webhooks/<id> -H 'X-Management-Token: <token>'
 
 # Last 20 delivery attempts: event, status, attempt count, response time, error
-curl http://localhost:8080/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
+curl https://api.straitprotocol.com/webhooks/<id>/deliveries -H 'X-Management-Token: <token>'
 
 # Unsubscribe (pending deliveries are removed with it)
-curl -X DELETE http://localhost:8080/webhooks/<id> -H 'X-Management-Token: <token>'`}</Pre>
+curl -X DELETE https://api.straitprotocol.com/webhooks/<id> -H 'X-Management-Token: <token>'`}</Pre>
     </Section>
   );
 }
