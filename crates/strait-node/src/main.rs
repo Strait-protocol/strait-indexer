@@ -16,6 +16,7 @@
 
 mod eth_withdrawal_reconciler;
 mod payout_watcher;
+mod pop_scanner;
 
 use std::sync::Arc;
 
@@ -107,6 +108,37 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // PoP scanner: Bitcoin finality from keystone publications in the PoP
+    // miners' Bitcoin transactions; works whether or not PoPPayoutsV2 is active.
+    let pop_scanner = match (&config.bitcoin.pop_esplora_url, config.bitcoin.pop_scan_start_height) {
+        (Some(_), _) if config.bitcoin.pop_miner_addresses.is_empty() => {
+            error!("POP_ESPLORA_URL set without POP_MINER_ADDRESSES — PoP scanner disabled");
+            None
+        }
+        (Some(url), Some(start)) => match strait_bitcoin::pop::EsploraClient::new(url) {
+            Ok(esplora) => Some(pop_scanner::PopScanner::new(
+                esplora,
+                hemi_provider.clone(),
+                db.clone(),
+                config.bitcoin.pop_miner_addresses.clone(),
+                start,
+                config.bitcoin.pop_min_confirmations,
+                config.bitcoin.pop_scan_delay_ms,
+            )),
+            Err(e) => {
+                error!("invalid POP_ESPLORA_URL ({e}) — PoP scanner disabled");
+                None
+            }
+        },
+        (Some(_), None) => {
+            error!("POP_ESPLORA_URL set without POP_SCAN_START_HEIGHT — PoP scanner disabled");
+            None
+        }
+        (None, _) => {
+            warn!("POP_ESPLORA_URL not set — Bitcoin PoP finality disabled");
+            None
+        }
+    };
     let hemi_ingester = EvmIngester::new(
         config.hemi.clone(),
         Chain::Hemi,
@@ -177,6 +209,13 @@ async fn main() -> anyhow::Result<()> {
         tasks.spawn(async move {
             if let Err(e) = reconciler.run().await {
                 error!("Hemi→ETH withdrawal reconciler exited: {e}");
+            }
+        });
+    }
+    if let Some(scanner) = pop_scanner {
+        tasks.spawn(async move {
+            if let Err(e) = scanner.run().await {
+                error!("PoP scanner exited: {e}");
             }
         });
     }

@@ -8,6 +8,7 @@ pub mod tunnel_transfers;
 pub mod checkpoints;
 pub mod events;
 pub mod pop_proofs;
+pub mod pop_publications;
 pub mod webhooks;
 
 pub use db::Database;
@@ -16,6 +17,9 @@ pub use tunnel_transfers::{status_str, AnalyticsBucketRow, TunnelTransferRepo, T
 pub use checkpoints::{Checkpoint, CheckpointRepo, UpsertCheckpoint};
 pub use events::{IndexedEvent, EventRepo, CreateEvent};
 pub use pop_proofs::{PopProof, PopProofRepo, PopProofStatus, CreatePopProof};
+pub use pop_publications::{
+    NewPublication, PopCoverage, PopFinalityRow, PopRepo, PopSyncState, UnvalidatedPublication,
+};
 pub use webhooks::{
     CreateWebhookSubscription, DueDelivery, WebhookDeliveryRow, WebhookRepo, WebhookSubscriptionRow,
 };
