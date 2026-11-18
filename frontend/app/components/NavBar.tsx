@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
@@ -37,8 +38,13 @@ export default function NavBar({ extras }: { extras?: React.ReactNode }) {
     <header className="sticky top-0 z-50 border-b border-white/[0.06] bg-[#0a0a0a]/80 backdrop-blur-md">
       <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
         <div className="flex items-center gap-8">
-          <Link href="/" className="text-orange-400 font-mono text-xl font-bold tracking-tight">
-            ⊕ Strait
+          <Link
+            href="/"
+            className="flex items-center gap-2.5 text-orange-400 font-mono text-xl font-bold tracking-tight"
+          >
+            {/* 96px source rendered at 32px: sharp on 3x screens. */}
+            <Image src="/logo.png" alt="" width={32} height={32} priority className="rounded-md" />
+            Strait
           </Link>
           <nav className="hidden md:flex items-center gap-6 text-sm">{links}</nav>
         </div>
