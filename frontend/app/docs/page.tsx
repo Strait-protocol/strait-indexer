@@ -102,13 +102,18 @@ function DataModel() {
   const rows: [string, string, string][] = [
     ["id", "UUID", "Deterministic id (Hemi tx hash + log index). Stable — use as a key."],
     ["asset", "String", "BTC, ETH, or an ERC-20 symbol."],
+    ["assetDecimals", "Int?", "Token decimals, resolved on-chain. Divide amount by 10^assetDecimals."],
+    ["assetContract", "String?", "ERC-20 contract address (null for native BTC / ETH)."],
     ["direction", "Enum", "IN (into Hemi) or OUT (out of Hemi)."],
     ["route", "Enum", "BTC_TO_HEMI · HEMI_TO_BTC · ETH_TO_HEMI · HEMI_TO_ETH."],
     ["amount", "String", "Atomic units (satoshis or wei) as a decimal string."],
     ["sender / recipient", "String", "Origin / destination address (EVM 0x… or Bitcoin)."],
-    ["status", "Enum", "INITIATED · PROVING · FINALIZED · FAILED · REORGED."],
+    ["status", "Enum", "INITIATED · PROVING · FINALIZED · FAILED · REORGED (ANCHORED is reserved, not currently set)."],
     ["sourceChain / sourceTxHash / sourceBlock", "—", "The initiating leg."],
     ["destChain / destTxHash / destBlock", "—", "The counterpart leg (null until it confirms)."],
+    ["sourceFee / destFee", "String?", "Gas paid on each leg, in the chain's native atomic units."],
+    ["withdrawalHash", "String?", "Hemi → ETH only: the OP Stack withdrawal hash Ethereum proves and finalizes by."],
+    ["provenAt", "DateTime?", "Hemi → ETH only: when the withdrawal was proven on Ethereum."],
     ["popAnchored / popKeystoneBlock / popScore", "—", "Bitcoin (PoP) anchoring fields."],
     ["initiatedAt / finalizedAt", "DateTime", "Real on-chain block times of each milestone."],
   ];
@@ -205,7 +210,7 @@ function Lifecycle() {
             <div>
               <span className="font-medium text-white">PoP keystone anchors the Hemi block <span className="font-normal text-zinc-500">(async, ~90 min — optional)</span></span>
               <p className="mt-0.5 text-zinc-400"><Code>PoPPayoutsV2.PayoutRoundExecuted</Code> fires for the keystone covering the mint block. <Code>status</Code> stays <Code>FINALIZED</Code>; Strait sets <Code>popAnchored=true</Code>. This upgrades the transfer to Bitcoin-grade finality independently of <Code>FINALIZED</Code>.</p>
-              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of June 2026. <Code>popAnchored</Code> stays false, but transfers still reach <Code>FINALIZED</Code> at mint.</p>
+              <p className="mt-1 text-zinc-500 text-xs">Note: PoP payouts are not yet activated on mainnet as of November 2026. <Code>popAnchored</Code> stays false, but transfers still reach <Code>FINALIZED</Code> at mint.</p>
             </div>
           </li>
         </ol>
@@ -217,27 +222,27 @@ function Lifecycle() {
           Hemi → ETH <span className="ml-2 text-xs font-normal text-zinc-500">withdrawal · ~1 day</span>
         </h3>
         <Pre>{`INITIATED ──► PROVING ─────────────────────────────► FINALIZED
-              (1-day challenge window)`}</Pre>
+              (1-day challenge window)              (or FAILED if the claim reverts)`}</Pre>
         <ol className="space-y-3 text-sm text-zinc-300">
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">1</span>
             <div>
               <span className="font-medium text-white">User calls <Code>withdraw</Code> on the L2StandardBridge on Hemi</span>
-              <p className="mt-0.5 text-zinc-400">ETH is burned on Hemi. Strait sees <Code>ETHBridgeInitiated</Code> and records the transfer as <Code>INITIATED</Code>.</p>
+              <p className="mt-0.5 text-zinc-400">ETH is burned on Hemi. Strait sees <Code>ETHBridgeInitiated</Code> and records the transfer as <Code>INITIATED</Code>, with the <Code>withdrawalHash</Code> from the same transaction&apos;s <Code>MessagePassed</Code> log.</p>
             </div>
           </li>
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">2</span>
             <div>
               <span className="font-medium text-white">User calls <Code>proveWithdrawalTransaction</Code> on OptimismPortal <span className="font-normal text-zinc-500">(after output root is published, ~1 hour)</span></span>
-              <p className="mt-0.5 text-zinc-400">The withdrawal is proven against the L2 output root on Ethereum. Strait sees <Code>WithdrawalProven</Code> and advances to <Code>PROVING</Code>. The 1-day challenge window begins.</p>
+              <p className="mt-0.5 text-zinc-400">The withdrawal is proven against the L2 output root on Ethereum. Strait reads OptimismPortal&apos;s <Code>provenWithdrawals(withdrawalHash)</Code>, advances to <Code>PROVING</Code> and sets <Code>provenAt</Code>. The 1-day challenge window begins. Anyone can prove a withdrawal; until someone does, it waits indefinitely.</p>
             </div>
           </li>
           <li className="flex gap-3">
             <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs text-zinc-400">3</span>
             <div>
               <span className="font-medium text-white">Challenge window elapses <span className="font-normal text-zinc-500">(~1 day after proving)</span></span>
-              <p className="mt-0.5 text-zinc-400">Anyone calls <Code>finalizeWithdrawalTransaction</Code> on OptimismPortal. ETH is released on Ethereum. Strait sees <Code>ETHBridgeFinalized</Code> on L1 and advances to <Code>FINALIZED</Code>.</p>
+              <p className="mt-0.5 text-zinc-400">Anyone calls <Code>finalizeWithdrawalTransaction</Code> on OptimismPortal. ETH is released on Ethereum. Strait matches the portal&apos;s <Code>WithdrawalFinalized</Code> log by <Code>withdrawalHash</Code> and advances to <Code>FINALIZED</Code>, with the claim transaction as the destination leg. If the relay reverted (<Code>success = false</Code>), the transfer becomes <Code>FAILED</Code>.</p>
             </div>
           </li>
         </ol>
@@ -629,7 +634,7 @@ function Contracts() {
         </table>
       </div>
       <Callout>
-        <strong>PoP anchoring status (June 2026):</strong> The <Code>PoPPayoutsV2</Code>{" "}
+        <strong>PoP anchoring status (November 2026):</strong> The <Code>PoPPayoutsV2</Code>{" "}
         contracts are deployed on mainnet but <Code>mintPoPRewards()</Code> has not yet been
         called — <Code>lastBlockRewarded = 0</Code> on both deployments.{" "}
         <Code>BTC_TO_HEMI</Code> deposits already reach <Code>FINALIZED</Code> at the Hemi

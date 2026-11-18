@@ -658,7 +658,7 @@ function BuiltOnStrait() {
     },
     {
       name: 'Strait Webhooks',
-      status: 'In progress',
+      status: 'Live',
       desc: 'HMAC-signed push notifications for transfer lifecycle events — register a URL, get notified the moment a matching transfer finalizes or fails.',
       cta: 'Register a webhook',
       href: '/webhooks',

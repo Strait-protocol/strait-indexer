@@ -66,7 +66,7 @@ Two deployments exist on Hemi Mainnet (owner `0xE067Dd6965bd87C81AbE658ed42FC02e
 | Canonical (used by Strait) | `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` | 3,497,724 | `0x92f03ea43ee029dbd28b63029d6f07e1efdb7a1a` |
 | First deployment | `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40` | 3,497,671 | `0xf9705145175800f6f2e4a81261a4cb5406da6023` |
 
-> **Activation status (June 2026):** `mintPoPRewards()` has never been called — `lastBlockRewarded = 0` on both contracts. PoP payouts are not yet active on mainnet.
+> **Activation status (last checked November 18, 2026):** `mintPoPRewards()` has never been called — `lastBlockRewarded = 0` on both contracts. PoP payouts are not yet active on mainnet.
 
 ---
 

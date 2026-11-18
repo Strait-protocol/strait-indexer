@@ -12,14 +12,14 @@ Hemi anchors its blocks to Bitcoin through Proof-of-Publication (PoP). This is w
 
 ---
 
-## Mainnet deployment status (as of June 2026)
+## Mainnet deployment status (as of November 2026)
 
 Two `PoPPayoutsV2` contracts were deployed on Hemi Mainnet by the Hemi team (owner `0xE067Dd6965bd87C81AbE658ed42FC02eB41d5Bd3`):
 
 - **First deployment** — `0x9417dd2eba413cfc11e8d8e368c007bfa1385a40`, block 3,497,671, factory `0xf9705145175800f6f2e4a81261a4cb5406da6023`
 - **Canonical deployment** — `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b`, block 3,497,724, factory `0x92f03ea43ee029dbd28b63029d6f07e1efdb7a1a`
 
-**`mintPoPRewards()` has never been called on either contract** — `lastBlockRewarded = 0` on both as of June 30, 2026. PoP payouts are not yet activated on mainnet.
+**`mintPoPRewards()` has never been called on either contract** — `lastBlockRewarded = 0` on both, last checked November 18, 2026. PoP payouts are not yet activated on mainnet.
 
 Practical impact: BTC→Hemi deposits already reach `FINALIZED` status at Hemi mint — the user has their hBTC regardless of PoP activation. The `popAnchored` field will remain `false` on all deposits until the Hemi team activates the system by calling `mintPoPRewards()` for the first time. Strait is wired to watch `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b` via `HEMI_POP_PAYOUTS_CONTRACT` and will begin updating `popAnchored` automatically once `PayoutRoundExecuted` events start firing.
 

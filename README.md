@@ -605,7 +605,7 @@ sqlx migrate add <name>   # scaffold a new migration (then edit the .sql)
 | BTC tunnel contract address + ABI | Confirmed — `BitcoinTunnelManager` from [`hemilabs/bitcoin-tunnel-contracts`](https://github.com/hemilabs/bitcoin-tunnel-contracts) |
 | OP_RETURN encoding | Confirmed — 22-byte (raw) or 42-byte (ASCII hex) from `SimpleBitcoinVaultUTXOLogicHelper.sol` |
 | PoP proof contract | Confirmed — `PoPPayoutsV2` via keystone anchoring from [`hemilabs/pop-payouts`](https://github.com/hemilabs/pop-payouts). Testnet: `0x4a3b61C586DB4CD219E85aC0697b66916c7457AB`. Mainnet: two deployments (see Contract Addresses). |
-| `PoPPayoutsV2` mainnet address | Confirmed — two deployments exist, canonical: `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b`. `mintPoPRewards()` not yet called as of June 2026 — PoP payouts pending Hemi activation. |
+| `PoPPayoutsV2` mainnet address | Confirmed — two deployments exist, canonical: `0x9a23ab7cb11cfb96e577da52a6ad5211ff24434b`. `mintPoPRewards()` not yet called as of November 2026 (`lastBlockRewarded = 0` on both) — PoP payouts pending Hemi activation. |
 | Reorg frequency in production | **Still open** — ask at Hemi office hour |
 
 ---

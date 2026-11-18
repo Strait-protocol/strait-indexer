@@ -37,7 +37,7 @@ domain logic — including price conversion, which does **not** belong in `strai
 
 ## Do we need a webhook?
 
-**No.** Webhooks (still unbuilt — see README "Open Items") push events to external
+**No.** Webhooks (built since this plan was written — see [api-integration.md §10](api-integration.md#10-webhooks)) push events to external
 subscribers in real time. Analytics is the opposite shape: pull pre-aggregated
 historical data on page load/refresh. `strait-api`'s existing GraphQL surface is the
 right transport, extended with aggregation queries (below) — `analytics/` is just
