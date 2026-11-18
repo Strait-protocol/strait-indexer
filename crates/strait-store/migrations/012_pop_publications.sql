@@ -2,27 +2,42 @@
 --
 -- PoP miners publish Hemi keystones (every 25th Hemi block) to Bitcoin in
 -- OP_RETURN outputs, whether or not the PoPPayoutsV2 reward contract is active.
--- Strait scans Bitcoin blocks for these publications and uses them to mark
--- transfers Bitcoin-final, and to answer "which Bitcoin tx anchors Hemi block N?".
+-- Strait follows the transaction history of the known PoP miner wallets
+-- (POP_MINER_ADDRESSES) and uses their publications to mark transfers
+-- Bitcoin-final, and to answer "which Bitcoin tx anchors Hemi block N?".
 --
--- pop_scanned_blocks is contiguous from the configured start height: the scanner
--- only ever appends the next height, and a Bitcoin reorg deletes from the fork
--- point up (cascading to its publications). That contiguity is what makes "the
--- earliest publication of any keystone >= N" a correct query.
+-- pop_sync_state.synced_height is the Bitcoin height up to which every known
+-- miner's history has been read completely. The finality queries only trust
+-- publications at or below it, so "the earliest publication of any keystone
+-- >= N" can't be answered from a partially read history.
 
-CREATE TABLE IF NOT EXISTS pop_scanned_blocks (
-    height       BIGINT PRIMARY KEY,
-    hash         TEXT NOT NULL,
-    block_time   TIMESTAMPTZ NOT NULL,
-    publications INT NOT NULL DEFAULT 0,
-    scanned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS pop_sync_state (
+    id             BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    -- POP_SCAN_START_HEIGHT and that block's time: publications before it are
+    -- not collected, so blocks near it can't be answered for.
+    start_height   BIGINT NOT NULL,
+    start_time     TIMESTAMPTZ NOT NULL,
+    -- Every miner's history is complete up to here.
+    synced_height  BIGINT,
+    -- Bitcoin tip at the last sync, for counting confirmations.
+    tip_height     BIGINT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS pop_miners (
+    address        TEXT PRIMARY KEY,
+    -- This miner's history is complete up to here (NULL: never synced).
+    synced_height  BIGINT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS pop_publications (
     btc_txid         TEXT NOT NULL,
     vout             INT NOT NULL,
-    btc_block_height BIGINT NOT NULL REFERENCES pop_scanned_blocks(height) ON DELETE CASCADE,
+    btc_block_height BIGINT NOT NULL,
+    btc_block_hash   TEXT NOT NULL,
     btc_block_time   TIMESTAMPTZ NOT NULL,
+    miner_address    TEXT NOT NULL,
     -- Hemi keystone block this publication is for (multiple of 25).
     keystone_block   BIGINT NOT NULL,
     l1_block         BIGINT NOT NULL,

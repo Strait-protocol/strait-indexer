@@ -20,11 +20,11 @@ pub const SUPER_FINAL_CONFIRMATIONS: i64 = 10;
 pub enum PopFinalityStatus {
     /// A valid Bitcoin publication anchors this block (see `confirmations`).
     Anchored,
-    /// Inside the scanned range, but no publication covers it yet. Recent
+    /// Inside the synced range, but no publication covers it yet. Recent
     /// blocks wait for the next PoP publication batch.
     Pending,
-    /// Before the scanned range: an earlier publication may exist that Strait
-    /// hasn't scanned, so it can't name the first anchor.
+    /// Before the synced range: an earlier publication may exist that Strait
+    /// hasn't read, so it can't name the first anchor.
     NotCovered,
 }
 
@@ -41,7 +41,7 @@ pub struct PopFinality {
     pub bitcoin_vout: Option<i32>,
     pub bitcoin_block: Option<i64>,
     pub bitcoin_block_time: Option<DateTime<Utc>>,
-    /// Bitcoin confirmations of the publication, counted to Strait's scanned tip.
+    /// Bitcoin confirmations of the publication, as of Strait's last sync.
     pub confirmations: Option<i64>,
     /// `confirmations >= 6`: the threshold Strait uses for `popAnchored`.
     pub bitcoin_final: bool,
@@ -49,8 +49,8 @@ pub struct PopFinality {
     pub super_final: bool,
     /// Lowest Hemi block this lookup can answer for.
     pub covered_from_hemi_block: Option<i64>,
-    /// Latest Bitcoin block scanned.
-    pub scanned_bitcoin_tip: Option<i64>,
+    /// Bitcoin height up to which the PoP miners' publications are fully read.
+    pub synced_bitcoin_height: Option<i64>,
 }
 
 pub async fn lookup(db: &Database, hemi_block: i64) -> Result<PopFinality> {
@@ -68,7 +68,7 @@ pub async fn lookup(db: &Database, hemi_block: i64) -> Result<PopFinality> {
         bitcoin_final: false,
         super_final: false,
         covered_from_hemi_block: cov.min_hemi_block,
-        scanned_bitcoin_tip: cov.tip_height,
+        synced_bitcoin_height: cov.synced_height,
     };
     match cov.min_hemi_block {
         Some(min) if hemi_block >= min => {}

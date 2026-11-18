@@ -1,17 +1,22 @@
-//! PoP scanner: reads Hemi keystone publications straight from Bitcoin and marks
-//! transfers Bitcoin-final, independent of the PoPPayoutsV2 reward contract.
+//! PoP scanner: reads Hemi keystone publications from the PoP miners' Bitcoin
+//! transactions and marks transfers Bitcoin-final, independent of the
+//! PoPPayoutsV2 reward contract.
+//!
+//! Rather than downloading every Bitcoin block, it follows the transaction
+//! history of the known miner wallets (`POP_MINER_ADDRESSES`) through Esplora:
+//! a few MB to backfill, then about one small request a minute per miner.
+//! Publications from wallets not in that list are not seen.
 //!
 //! Each tick:
-//!  1. **Reorg check**: compare the last few scanned block hashes with Esplora;
-//!     on a mismatch, drop scanned blocks from the fork point (publications cascade).
-//!  2. **Scan**: walk Bitcoin forward from the last scanned height (or
-//!     `POP_SCAN_START_HEIGHT`), decoding `OP_RETURN "HEMI" + keystone` outputs.
-//!     Heights stay contiguous, which the finality query relies on.
-//!  3. **Validate**: check each new publication against the canonical Hemi block
+//!  1. **Sync**: for each miner, read its confirmed transactions newest-first
+//!     back to where the last sync ended (minus a reorg margin), or to
+//!     `POP_SCAN_START_HEIGHT` on the first run, storing `OP_RETURN "HEMI"`
+//!     publications. Re-read publications are moved if a reorg re-mined them.
+//!  2. **Validate**: check each new publication against the canonical Hemi block
 //!     it names (block hash / parent hash / state root prefixes). Forged or
 //!     non-canonical publications are marked invalid and never anchor anything.
-//!  4. **Anchor**: mark transfers whose Hemi block is covered by a publication
-//!     with enough confirmations, and enqueue `transfer.pop_anchored` webhooks.
+//!  3. **Anchor**: mark transfers covered by a publication with enough
+//!     confirmations, and enqueue `transfer.pop_anchored` webhooks.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,27 +27,26 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use strait_api::webhooks::dispatcher::{self, event};
-use strait_bitcoin::pop::{scan_raw_block, EsploraClient, KeystoneAbrev};
-use strait_core::error::{Result, StraitError};
-use strait_store::{Database, NewPublication, NewScannedBlock, PopRepo, TunnelTransferRepo};
+use strait_bitcoin::pop::{EsploraClient, KeystoneAbrev};
+use strait_core::error::Result;
+use strait_store::{Database, NewPublication, PopRepo, TunnelTransferRepo};
 
-/// Blocks scanned per tick while catching up; the tick then validates and
-/// anchors, so a long backfill makes visible progress as it goes.
-const SCAN_BATCH: u64 = 30;
-/// Recent scanned blocks re-checked against Esplora for a Bitcoin reorg.
-const REORG_DEPTH: i64 = 6;
+/// Blocks re-read below a miner's last synced height, to pick up publications
+/// that a Bitcoin reorg moved.
+const REORG_MARGIN: i64 = 6;
 /// Publications validated per tick.
 const VALIDATE_BATCH: i64 = 500;
-/// Sleep between ticks once caught up with the Bitcoin tip (~1 block / 10 min).
-const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+/// Sleep between ticks (~1 Bitcoin block / 10 min).
+const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct PopScanner {
     esplora: EsploraClient,
     hemi_provider: Arc<dyn Provider>,
     db: Database,
+    miners: Vec<String>,
     start_height: u64,
     min_confirmations: i64,
-    delay: Duration,
+    page_delay: Duration,
 }
 
 impl PopScanner {
@@ -50,116 +54,121 @@ impl PopScanner {
         esplora: EsploraClient,
         hemi_provider: Arc<dyn Provider>,
         db: Database,
+        miners: Vec<String>,
         start_height: u64,
         min_confirmations: u32,
-        delay_ms: u64,
+        page_delay_ms: u64,
     ) -> Self {
         Self {
             esplora,
             hemi_provider,
             db,
+            miners,
             start_height,
             min_confirmations: i64::from(min_confirmations.max(1)),
-            delay: Duration::from_millis(delay_ms),
+            page_delay: Duration::from_millis(page_delay_ms),
         }
     }
 
     pub async fn run(self) -> Result<()> {
         info!(
+            miners = ?self.miners,
             start_height = self.start_height,
             min_confirmations = self.min_confirmations,
-            "PoP scanner started (Bitcoin keystone publications)"
+            "PoP scanner started (miner wallets → Bitcoin keystone publications)"
         );
+        while let Err(e) = self.init().await {
+            warn!(error = %e, "PoP scanner init failed — retrying");
+            sleep(TICK_INTERVAL).await;
+        }
         loop {
-            let caught_up = match self.tick().await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "PoP scanner tick failed");
-                    true // back off as if idle
-                }
-            };
-            if caught_up {
-                sleep(IDLE_INTERVAL).await;
+            if let Err(e) = self.tick().await {
+                warn!(error = %e, "PoP scanner tick failed");
             }
+            sleep(TICK_INTERVAL).await;
         }
     }
 
-    /// One pass. Returns true once the scan has reached the Bitcoin tip.
-    async fn tick(&self) -> Result<bool> {
-        let tip = self.esplora.tip_height().await?;
-        self.check_reorg().await?;
-        let caught_up = self.scan_batch(tip).await?;
-        self.validate().await?;
-        self.anchor().await?;
-        Ok(caught_up)
-    }
-
-    async fn check_reorg(&self) -> Result<()> {
+    async fn init(&self) -> Result<()> {
+        let start_time = self.esplora.block_time(self.start_height).await?;
         let repo = PopRepo::new(&self.db);
-        let mut fork_at: Option<i64> = None;
-        for (height, hash) in repo.recent_scanned(REORG_DEPTH).await? {
-            let remote = self.esplora.block_hash(height as u64).await?;
-            if remote == hash {
-                break; // everything at and below this height is still canonical
-            }
-            fork_at = Some(height);
-        }
-        if let Some(h) = fork_at {
-            let removed = repo.delete_from(h).await?;
-            warn!(from_height = h, removed, "Bitcoin reorg — dropped scanned PoP blocks for rescan");
+        repo.init_state(self.start_height as i64, start_time).await?;
+        for m in &self.miners {
+            repo.ensure_miner(m).await?;
         }
         Ok(())
     }
 
-    async fn scan_batch(&self, tip: u64) -> Result<bool> {
+    async fn tick(&self) -> Result<()> {
+        let tip = self.esplora.tip_height().await? as i64;
         let repo = PopRepo::new(&self.db);
-        let next = match repo.scanned_tip().await? {
-            Some((h, _)) => h as u64 + 1,
-            None => self.start_height,
+        // The synced height is the lowest across miners: a miner whose sync
+        // failed holds it back, so its missing history can't skew "earliest".
+        let mut synced: Option<i64> = Some(tip);
+        for miner in &self.miners {
+            match self.sync_miner(miner, tip).await {
+                Ok(()) => {}
+                Err(e) => warn!(miner, error = %e, "PoP miner sync failed — will retry"),
+            }
+            let h = repo.miner_synced_height(miner).await?;
+            synced = match (synced, h) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                _ => None,
+            };
+        }
+        repo.set_synced(synced, tip).await?;
+        self.validate().await?;
+        self.anchor().await
+    }
+
+    async fn sync_miner(&self, miner: &str, tip: i64) -> Result<()> {
+        let repo = PopRepo::new(&self.db);
+        let start = self.start_height as i64;
+        let floor = match repo.miner_synced_height(miner).await? {
+            Some(h) => (h - REORG_MARGIN).max(start),
+            None => start,
         };
-        if next > tip {
-            return Ok(true);
-        }
-        let end = tip.min(next + SCAN_BATCH - 1);
-        for height in next..=end {
-            let hash = self.esplora.block_hash(height).await?;
-            let raw = self.esplora.raw_block(&hash).await?;
-            let block = scan_raw_block(&raw)?;
-            if block.hash != hash {
-                return Err(StraitError::Parse(format!(
-                    "Bitcoin block {height}: decoded hash {} != expected {hash}",
-                    block.hash
-                )));
+        let (mut after, mut pages, mut found) = (None::<String>, 0u32, 0usize);
+        loop {
+            let page = self.esplora.address_txs(miner, after.as_deref()).await?;
+            let Some(last) = page.last() else { break };
+            let oldest = last.block_height as i64;
+            after = Some(last.txid.clone());
+            pages += 1;
+            for tx in &page {
+                if (tx.block_height as i64) < start {
+                    continue;
+                }
+                for (vout, k) in &tx.publications {
+                    repo.upsert_publication(&NewPublication {
+                        btc_txid: tx.txid.clone(),
+                        vout: *vout as i32,
+                        btc_block_height: tx.block_height as i64,
+                        btc_block_hash: tx.block_hash.clone(),
+                        btc_block_time: tx.block_time,
+                        miner_address: miner.to_string(),
+                        keystone_block: i64::from(k.l2_block),
+                        l1_block: i64::from(k.l1_block),
+                        ep_hash: hex::encode(k.ep_hash),
+                        raw_keystone: hex::encode(k.to_bytes()),
+                    })
+                    .await?;
+                    found += 1;
+                }
             }
-            let publications: Vec<NewPublication> = block
-                .publications
-                .iter()
-                .map(|p| NewPublication {
-                    btc_txid: p.txid.clone(),
-                    vout: p.vout as i32,
-                    keystone_block: i64::from(p.keystone.l2_block),
-                    l1_block: i64::from(p.keystone.l1_block),
-                    ep_hash: hex::encode(p.keystone.ep_hash),
-                    raw_keystone: hex::encode(p.keystone.to_bytes()),
-                })
-                .collect();
-            if !publications.is_empty() {
-                let lo = publications.iter().map(|p| p.keystone_block).min().unwrap_or(0);
-                let hi = publications.iter().map(|p| p.keystone_block).max().unwrap_or(0);
-                info!(height, count = publications.len(), keystones = %format!("{lo}..={hi}"), "PoP publications found on Bitcoin");
-            } else if height % 100 == 0 {
-                info!(height, tip, "PoP scan progress");
+            if oldest < floor {
+                break;
             }
-            repo.insert_block(&NewScannedBlock {
-                height: height as i64,
-                hash,
-                time: block.time,
-                publications,
-            })
-            .await?;
-            sleep(self.delay).await;
+            if pages % 20 == 0 {
+                info!(miner, pages, oldest_height = oldest, floor, "PoP backfill progress");
+            }
+            sleep(self.page_delay).await;
         }
-        Ok(end >= tip)
+        repo.set_miner_synced_height(miner, tip).await?;
+        if found > 0 {
+            info!(miner, pages, publications = found, synced_to = tip, "PoP miner synced");
+        }
+        Ok(())
     }
 
     async fn validate(&self) -> Result<()> {
@@ -168,7 +177,7 @@ impl PopScanner {
         if pending.is_empty() {
             return Ok(());
         }
-        // One Hemi block fetch per keystone, however many miners published it.
+        // One Hemi block fetch per keystone, however many times it was published.
         let mut by_keystone: BTreeMap<i64, Vec<_>> = BTreeMap::new();
         for p in pending {
             by_keystone.entry(p.keystone_block).or_default().push(p);
@@ -194,11 +203,11 @@ impl PopScanner {
                     .ok()
                     .and_then(|b| KeystoneAbrev::from_slice(&b))
                     .is_some_and(|k| k.matches_hemi_block(&hash, &parent, &root));
-                if !valid {
+                if valid {
+                    ok += 1;
+                } else {
                     warn!(txid = %p.btc_txid, keystone_block, "PoP publication does not match the canonical Hemi block — ignored");
                     bad += 1;
-                } else {
-                    ok += 1;
                 }
                 repo.set_valid(&p.btc_txid, p.vout, valid).await?;
             }
@@ -238,6 +247,8 @@ mod tests {
     use strait_api::pop::{lookup, PopFinalityStatus};
     use uuid::Uuid;
 
+    const MINER: &str = "17Fv7httdZvqMubbvMkQ9KLPiTSPobxAqF";
+
     async fn insert_transfer(db: &Database, route: &str, hemi_block: i64, hemi_time: chrono::DateTime<chrono::Utc>) -> Uuid {
         let id = Uuid::new_v4();
         let deposit = route.ends_with("TO_HEMI");
@@ -271,10 +282,10 @@ mod tests {
 
     #[tokio::test]
     #[ignore]
-    async fn scans_validates_and_anchors_real_mainnet_publications() {
+    async fn syncs_validates_and_anchors_real_mainnet_publications() {
         let url = std::env::var("POP_TEST_DATABASE_URL").expect("POP_TEST_DATABASE_URL");
         let db = strait_store::init_database(&url).await.unwrap();
-        sqlx::query("TRUNCATE pop_scanned_blocks, pop_publications, tunnel_transfers CASCADE")
+        sqlx::query("TRUNCATE pop_sync_state, pop_miners, pop_publications, tunnel_transfers CASCADE")
             .execute(db.pool())
             .await
             .unwrap();
@@ -283,33 +294,38 @@ mod tests {
         // Real Hemi block times (rpc.hemi.network).
         let a = insert_transfer(&db, "HEMI_TO_ETH", 5_757_610, utc("2026-11-17 23:27:11")).await;
         let d = insert_transfer(&db, "ETH_TO_HEMI", 5_757_700, utc("2026-11-17 23:45:11")).await;
-        // Before the scan window (+2h margin): must not be anchored.
+        // Before the start height (+2h margin): must not be anchored.
         let c = insert_transfer(&db, "HEMI_TO_ETH", 5_757_300, utc("2026-11-17 20:00:00")).await;
 
         let scanner = PopScanner::new(
             EsploraClient::new("https://mempool.space/api").unwrap(),
             crate::build_provider("https://rpc.hemi.network/rpc").unwrap(),
             db.clone(),
+            vec![MINER.to_string()],
             // Mined ~20:3x UTC: A's Hemi block (23:27) clears the 2h start margin.
             976_318,
             6,
-            150,
+            250,
         );
+        scanner.init().await.unwrap();
         // Public Esplora drops the odd request; the real loop retries, so do we.
-        let mut caught_up = false;
-        for _ in 0..20 {
+        let mut ok = false;
+        for _ in 0..5 {
             match scanner.tick().await {
-                Ok(true) => {
-                    caught_up = true;
+                Ok(()) => {
+                    ok = true;
                     break;
                 }
-                Ok(false) => {}
                 Err(e) => println!("tick error (retrying): {e}"),
             }
         }
-        assert!(caught_up, "scanner never reached the Bitcoin tip");
-        // A final pass validates and anchors whatever the last scan added.
+        assert!(ok, "no successful tick");
+        // A second tick is the steady state: one page per miner.
         scanner.tick().await.unwrap();
+
+        let state = PopRepo::new(&db).state().await.unwrap().unwrap();
+        println!("sync state: {state:?}");
+        assert_eq!(state.synced_height, state.tip_height);
 
         let repo = TunnelTransferRepo::new(&db);
         let ra = repo.get(a).await.unwrap().unwrap();
@@ -319,30 +335,34 @@ mod tests {
         println!("D: anchored={} keystone={:?} btc={:?} {:?}", rd.pop_anchored, rd.pop_keystone_block, rd.pop_btc_block, rd.pop_btc_txid);
         println!("C: anchored={}", rc.pop_anchored);
 
+        // Same answers the full block scan produced for these transfers.
         assert!(ra.pop_anchored);
         assert_eq!(ra.pop_keystone_block, Some(5_757_625));
         assert_eq!(ra.pop_btc_block, Some(976_349));
+        assert_eq!(ra.pop_btc_txid.as_deref(), Some("4202e43a66a2e5aeea2be00fffcf09d53274b91df3a1e8ec2d68d64033c3031f"));
         assert!(rd.pop_anchored);
         assert_eq!(rd.pop_keystone_block, Some(5_757_700));
         assert_eq!(rd.pop_btc_txid.as_deref(), Some("06a408ff4007cd3c89b5f65f1e07222d0f8065c1053cfcbad8751d964b254bd5"));
-        assert!(!rc.pop_anchored, "transfer before the scan window must not be anchored");
+        assert!(!rc.pop_anchored, "transfer before the start height must not be anchored");
 
-        let invalid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pop_publications WHERE valid = FALSE")
-            .fetch_one(db.pool()).await.unwrap();
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pop_publications WHERE valid IS NULL")
-            .fetch_one(db.pool()).await.unwrap();
-        println!("publications invalid={invalid} unvalidated={pending}");
+        let (invalid, pending, total): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE valid = FALSE), COUNT(*) FILTER (WHERE valid IS NULL), COUNT(*)
+             FROM pop_publications",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        println!("publications total={total} invalid={invalid} unvalidated={pending}");
         assert_eq!(pending, 0);
+        assert!(total > 100);
 
         // The raw query answers for A's block…
         let f = PopRepo::new(&db).finality_for_hemi_block(5_757_610).await.unwrap().unwrap();
         assert_eq!((f.keystone_block, f.btc_block_height), (5_757_625, 976_349));
-        // …but the public lookup withholds it: with under a day scanned, every
+        // …but the public lookup withholds it: with under a day synced, every
         // keystone seen is inside the warm-up window, so earlier publications
         // can't be ruled out.
-        let l = lookup(&db, 5_757_610).await.unwrap();
-        println!("lookup 5757610: {l:?}");
-        assert_eq!(l.status, PopFinalityStatus::NotCovered);
+        assert_eq!(lookup(&db, 5_757_610).await.unwrap().status, PopFinalityStatus::NotCovered);
         assert_eq!(lookup(&db, 100).await.unwrap().status, PopFinalityStatus::NotCovered);
         assert_eq!(lookup(&db, 99_999_999).await.unwrap().status, PopFinalityStatus::Pending);
     }

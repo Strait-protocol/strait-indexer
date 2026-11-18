@@ -54,12 +54,17 @@ pub struct BitcoinConfig {
     /// Set via HEMI_VAULT_CONTRACTS (comma-separated EVM addresses).
     #[serde(default)]
     pub vault_contracts: Vec<String>,
-    /// Esplora REST API root (e.g. `https://mempool.space/api`) used to scan
-    /// Bitcoin blocks for Hemi PoP keystone publications. Unset disables the
-    /// PoP scanner. Set via POP_ESPLORA_URL.
+    /// Esplora REST API root (e.g. `https://mempool.space/api`) used to read
+    /// the PoP miners' Bitcoin transactions. Unset disables the PoP scanner.
+    /// Set via POP_ESPLORA_URL.
     #[serde(default)]
     pub pop_esplora_url: Option<String>,
-    /// First Bitcoin height to scan for PoP publications; pick one shortly
+    /// Bitcoin addresses of the PoP miners whose keystone publications Strait
+    /// follows. Publications from other wallets are not seen. Set via
+    /// POP_MINER_ADDRESSES (comma-separated).
+    #[serde(default)]
+    pub pop_miner_addresses: Vec<String>,
+    /// Earliest Bitcoin height to read publications from; pick one shortly
     /// before the oldest transfer you want marked Bitcoin-final. Required when
     /// the scanner is enabled. Set via POP_SCAN_START_HEIGHT.
     #[serde(default)]
@@ -68,8 +73,8 @@ pub struct BitcoinConfig {
     /// marked Bitcoin-final. Set via POP_MIN_CONFIRMATIONS (default 6).
     #[serde(default = "default_pop_min_confirmations")]
     pub pop_min_confirmations: u32,
-    /// Delay between Bitcoin block downloads while catching up, to stay within
-    /// public Esplora rate limits. Set via POP_SCAN_DELAY_MS (default 1000).
+    /// Delay between Esplora history pages while catching up, to stay within
+    /// public rate limits. Set via POP_SCAN_DELAY_MS (default 1000).
     #[serde(default = "default_pop_scan_delay_ms")]
     pub pop_scan_delay_ms: u64,
 }
@@ -285,6 +290,11 @@ impl AppConfig {
                     .filter(|s| !s.is_empty())
                     .collect(),
                 pop_esplora_url: env_opt("POP_ESPLORA_URL"),
+                pop_miner_addresses: env_str("POP_MINER_ADDRESSES")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
                 pop_scan_start_height: env_opt("POP_SCAN_START_HEIGHT").and_then(|v| v.parse().ok()),
                 pop_min_confirmations: env_parse(
                     "POP_MIN_CONFIRMATIONS",
@@ -409,6 +419,7 @@ mod tests {
                 payout_kit_rpc_url: None,
                 vault_contracts: vec![],
                 pop_esplora_url: None,
+                pop_miner_addresses: vec![],
                 pop_scan_start_height: None,
                 pop_min_confirmations: default_pop_min_confirmations(),
                 pop_scan_delay_ms: default_pop_scan_delay_ms(),

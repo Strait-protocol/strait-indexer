@@ -19,9 +19,8 @@
 
 use std::time::Duration;
 
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::Block;
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 
 use strait_core::error::{Result, StraitError};
 
@@ -106,47 +105,45 @@ pub fn parse_publication_script(script: &[u8]) -> Option<KeystoneAbrev> {
     Some(KeystoneAbrev::from_bytes(body))
 }
 
-/// One PoP publication found in a Bitcoin block.
+/// A confirmed transaction from a miner's history, with any PoP publications in it.
 #[derive(Debug, Clone)]
-pub struct Publication {
+pub struct MinerTx {
     /// Bitcoin txid, display (big-endian) hex.
     pub txid: String,
-    pub vout: u32,
-    pub keystone: KeystoneAbrev,
+    pub block_height: u64,
+    pub block_hash: String,
+    pub block_time: DateTime<Utc>,
+    /// `(vout, keystone)` for each PoP publication output. Usually one.
+    pub publications: Vec<(u32, KeystoneAbrev)>,
 }
 
-/// A scanned Bitcoin block and the publications it contains.
-#[derive(Debug, Clone)]
-pub struct ScannedBlock {
-    pub hash: String,
-    pub time: DateTime<Utc>,
-    pub publications: Vec<Publication>,
+#[derive(Deserialize)]
+struct EsploraTx {
+    txid: String,
+    vout: Vec<EsploraVout>,
+    status: EsploraStatus,
 }
 
-/// Decode a raw (consensus-serialized) Bitcoin block and extract its publications.
-pub fn scan_raw_block(raw: &[u8]) -> Result<ScannedBlock> {
-    let block: Block = deserialize(raw)
-        .map_err(|e| StraitError::Parse(format!("bitcoin block decode: {e}")))?;
-    let time = DateTime::from_timestamp(i64::from(block.header.time), 0)
-        .ok_or_else(|| StraitError::Parse("bitcoin block time out of range".into()))?;
+#[derive(Deserialize)]
+struct EsploraVout {
+    #[serde(default)]
+    scriptpubkey: String,
+}
 
-    let mut publications = Vec::new();
-    for tx in &block.txdata {
-        for (vout, out) in tx.output.iter().enumerate() {
-            if let Some(keystone) = parse_publication_script(out.script_pubkey.as_bytes()) {
-                publications.push(Publication {
-                    txid: tx.compute_txid().to_string(),
-                    vout: vout as u32,
-                    keystone,
-                });
-            }
-        }
-    }
-    Ok(ScannedBlock { hash: block.block_hash().to_string(), time, publications })
+#[derive(Deserialize)]
+struct EsploraStatus {
+    confirmed: bool,
+    block_height: Option<u64>,
+    block_hash: Option<String>,
+    block_time: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct EsploraBlock {
+    timestamp: i64,
 }
 
 /// Minimal Esplora REST client (mempool.space, blockstream.info, or self-hosted).
-/// Only the three calls needed to walk the chain and fetch raw blocks.
 pub struct EsploraClient {
     http: reqwest::Client,
     base: String,
@@ -156,10 +153,10 @@ impl EsploraClient {
     /// `base` is the API root, e.g. `https://mempool.space/api`.
     pub fn new(base: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(60))
             .user_agent("strait-indexer")
             .build()
-            .map_err(|e| StraitError::Internal(format!("http client: {e}")))?;
+            .map_err(|e| StraitError::Http(format!("http client: {e}")))?;
         Ok(Self { http, base: base.trim_end_matches('/').to_string() })
     }
 
@@ -186,21 +183,60 @@ impl EsploraClient {
             .map_err(|e| StraitError::Http(format!("esplora read {path}: {e}")))
     }
 
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get(path)
+            .await?
+            .json()
+            .await
+            .map_err(|e| StraitError::Parse(format!("esplora decode {path}: {e}")))
+    }
+
     pub async fn tip_height(&self) -> Result<u64> {
         let s = self.get_text("/blocks/tip/height").await?;
         s.parse().map_err(|_| StraitError::Parse(format!("esplora tip height: {s:?}")))
     }
 
-    pub async fn block_hash(&self, height: u64) -> Result<String> {
-        self.get_text(&format!("/block-height/{height}")).await
+    /// Timestamp of the block at `height`.
+    pub async fn block_time(&self, height: u64) -> Result<DateTime<Utc>> {
+        let hash = self.get_text(&format!("/block-height/{height}")).await?;
+        let b: EsploraBlock = self.get_json(&format!("/block/{hash}")).await?;
+        DateTime::from_timestamp(b.timestamp, 0)
+            .ok_or_else(|| StraitError::Parse(format!("block {height}: bad timestamp")))
     }
 
-    pub async fn raw_block(&self, hash: &str) -> Result<Vec<u8>> {
-        let res = self.get(&format!("/block/{hash}/raw")).await?;
-        res.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| StraitError::Http(format!("esplora raw block {hash}: {e}")))
+    /// One page (25 on mempool.space / Esplora) of an address's confirmed
+    /// transactions, newest first. Pass the last txid of the previous page as
+    /// `after` to continue. An empty page means the history is exhausted.
+    pub async fn address_txs(&self, address: &str, after: Option<&str>) -> Result<Vec<MinerTx>> {
+        let path = match after {
+            Some(txid) => format!("/address/{address}/txs/chain/{txid}"),
+            None => format!("/address/{address}/txs/chain"),
+        };
+        let page: Vec<EsploraTx> = self.get_json(&path).await?;
+        let mut out = Vec::with_capacity(page.len());
+        for tx in page {
+            let (Some(height), Some(hash), Some(time), true) = (
+                tx.status.block_height,
+                tx.status.block_hash,
+                tx.status.block_time,
+                tx.status.confirmed,
+            ) else {
+                continue;
+            };
+            let block_time = DateTime::from_timestamp(time, 0)
+                .ok_or_else(|| StraitError::Parse(format!("tx {}: bad block time", tx.txid)))?;
+            let publications = tx
+                .vout
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| {
+                    let script = hex::decode(&o.scriptpubkey).ok()?;
+                    parse_publication_script(&script).map(|k| (i as u32, k))
+                })
+                .collect();
+            out.push(MinerTx { txid: tx.txid, block_height: height, block_hash: hash, block_time, publications });
+        }
+        Ok(out)
     }
 }
 
@@ -249,22 +285,5 @@ mod tests {
         s[3] = b'X'; // wrong magic
         assert!(parse_publication_script(&s).is_none());
         assert!(parse_publication_script(&[0x6a, 0x04, 0, 0, 3, 0x27]).is_none()); // tunnel payout OP_RETURN
-    }
-}
-
-#[cfg(test)]
-mod block_fixture_test {
-    /// Decode a real raw block from disk: `POP_TEST_BLOCK=/path/block.bin cargo test -p strait-bitcoin -- --ignored`.
-    #[test]
-    #[ignore]
-    fn scans_real_block_from_disk() {
-        let path = std::env::var("POP_TEST_BLOCK").expect("POP_TEST_BLOCK");
-        let raw = std::fs::read(path).unwrap();
-        let b = super::scan_raw_block(&raw).unwrap();
-        println!("block {} at {} — {} publications", b.hash, b.time, b.publications.len());
-        for p in &b.publications {
-            println!("  {}:{} keystone {}", p.txid, p.vout, p.keystone.l2_block);
-        }
-        assert!(!b.publications.is_empty());
     }
 }

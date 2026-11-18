@@ -18,7 +18,7 @@ pub use checkpoints::{Checkpoint, CheckpointRepo, UpsertCheckpoint};
 pub use events::{IndexedEvent, EventRepo, CreateEvent};
 pub use pop_proofs::{PopProof, PopProofRepo, PopProofStatus, CreatePopProof};
 pub use pop_publications::{
-    NewPublication, NewScannedBlock, PopCoverage, PopFinalityRow, PopRepo, UnvalidatedPublication,
+    NewPublication, PopCoverage, PopFinalityRow, PopRepo, PopSyncState, UnvalidatedPublication,
 };
 pub use webhooks::{
     CreateWebhookSubscription, DueDelivery, WebhookDeliveryRow, WebhookRepo, WebhookSubscriptionRow,

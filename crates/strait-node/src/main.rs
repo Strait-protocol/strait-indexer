@@ -108,14 +108,19 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-    // PoP scanner: Bitcoin finality from keystone publications on Bitcoin, which
-    // works whether or not the PoPPayoutsV2 reward contract is active.
+    // PoP scanner: Bitcoin finality from keystone publications in the PoP
+    // miners' Bitcoin transactions; works whether or not PoPPayoutsV2 is active.
     let pop_scanner = match (&config.bitcoin.pop_esplora_url, config.bitcoin.pop_scan_start_height) {
+        (Some(_), _) if config.bitcoin.pop_miner_addresses.is_empty() => {
+            error!("POP_ESPLORA_URL set without POP_MINER_ADDRESSES — PoP scanner disabled");
+            None
+        }
         (Some(url), Some(start)) => match strait_bitcoin::pop::EsploraClient::new(url) {
             Ok(esplora) => Some(pop_scanner::PopScanner::new(
                 esplora,
                 hemi_provider.clone(),
                 db.clone(),
+                config.bitcoin.pop_miner_addresses.clone(),
                 start,
                 config.bitcoin.pop_min_confirmations,
                 config.bitcoin.pop_scan_delay_ms,
