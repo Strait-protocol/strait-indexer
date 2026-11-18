@@ -1,3 +1,5 @@
+import Image from "next/image";
+
 export default function Home() {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans">
@@ -23,10 +25,10 @@ function Nav() {
   return (
     <nav className="fixed top-0 inset-x-0 z-50 border-b border-white/[0.06] bg-[#0a0a0a]/80 backdrop-blur-md">
       <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="text-orange-400 font-mono text-xl font-bold tracking-tight">
-            ⊕ Strait
-          </span>
+        <div className="flex items-center gap-2.5 text-orange-400 font-mono text-xl font-bold tracking-tight">
+          {/* Same mark as the shared NavBar. */}
+          <Image src="/logo.png" alt="" width={32} height={32} priority className="rounded-md" />
+          Strait
         </div>
         <div className="hidden md:flex items-center gap-8 text-sm text-zinc-400">
           <a href="/dashboard" className="hover:text-white transition-colors">Explorer</a>
