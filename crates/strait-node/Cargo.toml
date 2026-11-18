@@ -27,3 +27,6 @@ bigdecimal = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }

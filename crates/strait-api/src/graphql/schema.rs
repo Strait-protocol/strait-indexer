@@ -62,6 +62,11 @@ pub struct Transfer {
     /// Aggregate PoP score of the anchoring keystone (0 = anchored, no publications).
     pub pop_score: Option<i64>,
     pub pop_anchored_at: Option<DateTime<Utc>>,
+    /// Bitcoin txid of the PoP publication that anchors this transfer: the
+    /// on-chain proof of its Bitcoin finality. Null until anchored.
+    pub pop_bitcoin_txid: Option<String>,
+    /// Bitcoin block height of that publication.
+    pub pop_bitcoin_block: Option<i64>,
 
     pub initiated_at: DateTime<Utc>,
     pub finalized_at: Option<DateTime<Utc>>,
@@ -97,6 +102,8 @@ impl From<TunnelTransferRow> for Transfer {
             pop_keystone_block: r.pop_keystone_block,
             pop_score: r.pop_score,
             pop_anchored_at: r.pop_anchored_at,
+            pop_bitcoin_txid: r.pop_btc_txid,
+            pop_bitcoin_block: r.pop_btc_block,
             initiated_at: r.initiated_at,
             finalized_at: r.finalized_at,
         }
@@ -229,6 +236,19 @@ impl Query {
         let offset = offset.unwrap_or(0).max(0);
         let rows = repo.list(limit, offset).await.map_err(to_gql)?;
         Ok(rows.into_iter().map(Transfer::from).collect())
+    }
+
+    /// Bitcoin finality of any Hemi block, from PoP keystone publications on
+    /// Bitcoin: which Bitcoin transaction anchors it, and how deeply.
+    async fn pop_finality(
+        &self,
+        ctx: &Context<'_>,
+        hemi_block: i64,
+    ) -> async_graphql::Result<crate::pop::PopFinality> {
+        if hemi_block < 0 {
+            return Err(async_graphql::Error::new("hemiBlock must be >= 0"));
+        }
+        crate::pop::lookup(db(ctx)?, hemi_block).await.map_err(to_gql)
     }
 
     /// Fetch a single transfer by its id.

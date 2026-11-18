@@ -62,6 +62,10 @@ pub struct TunnelTransferRow {
     pub pop_keystone_block: Option<i64>,
     pub pop_score: Option<i64>,
     pub pop_anchored_at: Option<DateTime<Utc>>,
+    /// Bitcoin txid of the PoP publication that anchors this transfer (migration 012).
+    pub pop_btc_txid: Option<String>,
+    /// Bitcoin block height of that publication.
+    pub pop_btc_block: Option<i64>,
 
     pub initiated_at: DateTime<Utc>,
     pub finalized_at: Option<DateTime<Utc>>,

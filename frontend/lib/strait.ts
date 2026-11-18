@@ -72,6 +72,9 @@ export type Transfer = {
   popKeystoneBlock: number | null;
   popScore: number | null;
   popAnchoredAt: string | null;
+  /** Bitcoin tx of the PoP publication that anchors this transfer (the proof). */
+  popBitcoinTxid: string | null;
+  popBitcoinBlock: number | null;
   initiatedAt: string;
   finalizedAt: string | null;
 };
@@ -92,7 +95,7 @@ const TRANSFER_FIELDS = `
   sourceChain sourceTxHash sourceBlock sourceTimestamp
   destChain destTxHash destBlock
   sourceFee destFee withdrawalHash provenAt
-  popAnchored popKeystoneBlock popScore popAnchoredAt
+  popAnchored popKeystoneBlock popScore popAnchoredAt popBitcoinTxid popBitcoinBlock
   initiatedAt finalizedAt
 `;
 

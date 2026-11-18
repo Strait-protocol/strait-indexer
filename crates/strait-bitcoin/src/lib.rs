@@ -2,6 +2,7 @@
 
 pub mod contracts;
 pub mod ingester;
+pub mod pop;
 pub mod reorg;
 pub mod watcher;
 

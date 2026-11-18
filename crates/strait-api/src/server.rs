@@ -56,6 +56,7 @@ pub async fn serve(config: ApiConfig, db: Database) -> anyhow::Result<()> {
         .route("/health/db", get(health_db))
         .route("/transfers", get(list_transfers))
         .route("/transfers/:id", get(get_transfer))
+        .route("/pop/finality/:hemi_block", get(get_pop_finality))
         .route("/webhooks", post(register_webhook))
         .route("/webhooks/:id", get(get_webhook).delete(delete_webhook))
         .route("/webhooks/:id/deliveries", get(list_webhook_deliveries))
@@ -142,6 +143,21 @@ async fn get_transfer(State(state): State<AppState>, Path(id): Path<Uuid>) -> im
             Json(json!({ "error": "transfer not found" })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Bitcoin finality of a Hemi block, from PoP keystone publications on Bitcoin.
+async fn get_pop_finality(State(state): State<AppState>, Path(hemi_block): Path<i64>) -> impl IntoResponse {
+    if hemi_block < 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "hemi_block must be >= 0" }))).into_response();
+    }
+    match crate::pop::lookup(state.db.as_ref(), hemi_block).await {
+        Ok(f) => (StatusCode::OK, Json(json!({ "finality": f }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
