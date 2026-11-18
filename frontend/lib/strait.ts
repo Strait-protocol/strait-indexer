@@ -202,17 +202,20 @@ export function statusStyle(status: string): { dot: string; text: string; label:
     case "FAILED":
       return { dot: "bg-red-500", text: "text-red-400", label: "Failed" };
     case "REORGED":
-      return { dot: "bg-red-500", text: "text-red-400", label: "Reorged" };
+      return { dot: "bg-fuchsia-400", text: "text-fuchsia-300", label: "Reorged" };
     default:
       return { dot: "bg-zinc-500", text: "text-zinc-400", label: status };
   }
 }
 
-/** Deposit (into Hemi) vs Withdrawal (out of Hemi), from the transfer direction. */
+/** Deposit (into Hemi) vs Withdrawal (out of Hemi), from the transfer direction.
+ *  Badges are deliberately neutral: every hue is reserved for a status (see
+ *  `statusStyle`), so the kind is told apart by its arrow and label, not color. */
 export function transferKind(direction: string): { label: string; hint: string; cls: string } {
+  const cls = "text-zinc-300 border-white/15";
   return direction === "OUT"
-    ? { label: "Withdrawal", hint: "out of Hemi", cls: "text-sky-300 border-sky-400/30" }
-    : { label: "Deposit", hint: "into Hemi", cls: "text-violet-300 border-violet-400/30" };
+    ? { label: "↑ Withdrawal", hint: "out of Hemi", cls }
+    : { label: "↓ Deposit", hint: "into Hemi", cls };
 }
 
 /** `route` is a path (`ETH_TO_HEMI` etc.), not a currency — the standard bridge
@@ -245,11 +248,14 @@ function decimalsFor(asset: string, decimals?: number | null): number {
 }
 
 /** Format an atomic-unit amount into a human value with its asset.
- *  Values ≥ 1 keep up to 6 fractional digits; values < 1 keep 6 significant
- *  digits, so a dust-sized amount never collapses to "0". */
+ *  Values ≥ 1 keep up to `digits` fractional digits; values < 1 keep `digits`
+ *  significant digits, so a dust-sized amount never collapses to "0".
+ *  Default 6 (detail page); tables pass `{ compact: true }` for 4. */
 export function formatAmount(
   t: { asset: string; amount: string; assetDecimals?: number | null },
+  opts: { compact?: boolean } = {},
 ): string {
+  const digits = opts.compact ? 4 : 6;
   const { asset, amount } = t;
   const decimals = decimalsFor(asset, t.assetDecimals);
   let v: bigint;
@@ -266,9 +272,9 @@ export function formatAmount(
   let fracStr = frac.toString().padStart(decimals, "0");
   if (whole === BigInt(0) && frac !== BigInt(0)) {
     const firstSig = fracStr.search(/[1-9]/);
-    fracStr = fracStr.slice(0, firstSig + 6);
+    fracStr = fracStr.slice(0, firstSig + digits);
   } else {
-    fracStr = fracStr.slice(0, 6);
+    fracStr = fracStr.slice(0, digits);
   }
   fracStr = fracStr.replace(/0+$/, "");
   const wholeStr = whole.toLocaleString("en-US");

@@ -26,10 +26,14 @@ export default function TransferRow({ t, network }: { t: Transfer; network: Netw
         <div className="font-mono text-zinc-100">{routeLabel(t.route)}</div>
         <div className="mt-1 flex items-center gap-2 text-[11px]">
           <span className={`rounded border px-1.5 py-0.5 ${kind.cls}`}>{kind.label}</span>
-          <span className="font-mono text-zinc-600">{t.id.slice(0, 8)}…</span>
+          <span className="font-mono text-zinc-600" title={`Strait transfer id ${t.id}`}>
+            #{t.id.slice(0, 8)}
+          </span>
         </div>
       </td>
-      <td className="px-4 py-3 tabular-nums text-zinc-200">{formatAmount(t)}</td>
+      <td className="px-4 py-3 text-right font-mono tabular-nums text-zinc-200" title={formatAmount(t)}>
+        {formatAmount(t, { compact: true })}
+      </td>
       <td className="px-4 py-3">
         <span className={`inline-flex items-center gap-1.5 ${s.text}`}>
           <span className={`h-2 w-2 rounded-full ${s.dot}`} />

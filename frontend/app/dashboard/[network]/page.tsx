@@ -77,9 +77,20 @@ export default async function DashboardPage({
       {/* Stat cards — all sourced from DB stats so the numbers are consistent */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Total transfers" value={stats.totalTransfers.toLocaleString()} />
-        <StatCard label="PoP-anchored" value={stats.popAnchored.toLocaleString()} accent />
         <StatCard label="Finalized" value={stats.finalized.toLocaleString()} />
-        <StatCard label="In flight" value={(stats.initiated + stats.proving + stats.anchored).toLocaleString()} />
+        <StatCard
+          label="In flight"
+          value={(stats.initiated + stats.proving + stats.anchored).toLocaleString()}
+          hint={`${stats.initiated.toLocaleString()} initiated · ${stats.proving.toLocaleString()} proving`}
+        />
+        {/* popAnchored is a flag, not a status: a transfer whose block a PoP keystone
+            has anchored to Bitcoin. It is NOT the ANCHORED status count in the funnel
+            below, so it must not share that label or color. */}
+        <StatCard
+          label="Bitcoin-final"
+          value={stats.popAnchored.toLocaleString()}
+          hint="PoP-anchored · tracked apart from status"
+        />
       </div>
 
       {/* Status funnel */}
@@ -95,7 +106,8 @@ export default async function DashboardPage({
           <span className="text-xs text-zinc-500">
             {transfers.length === 0
               ? "0 shown"
-              : `${(page - 1) * PAGE_SIZE + 1}–${(page - 1) * PAGE_SIZE + transfers.length}`}
+              : `${(page - 1) * PAGE_SIZE + 1}–${(page - 1) * PAGE_SIZE + transfers.length}` +
+                (filtering ? "" : ` of ${stats.totalTransfers.toLocaleString()}`)}
           </span>
         </div>
 
@@ -108,11 +120,11 @@ export default async function DashboardPage({
                 <thead>
                   <tr className="text-left text-xs uppercase tracking-wide text-zinc-500 border-b border-white/[0.06]">
                     <th className="font-medium px-4 py-3">Route</th>
-                    <th className="font-medium px-4 py-3">Amount</th>
+                    <th className="font-medium px-4 py-3 text-right">Amount</th>
                     <th className="font-medium px-4 py-3">Status</th>
                     <th className="font-medium px-4 py-3">From</th>
                     <th className="font-medium px-4 py-3">To</th>
-                    <th className="font-medium px-4 py-3 text-right">Age →</th>
+                    <th className="font-medium px-4 py-3 text-right" title="Newest first">Age ↓</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -130,26 +142,21 @@ export default async function DashboardPage({
   );
 }
 
-function StatCard({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-5 py-4">
       <div className="text-xs text-zinc-500">{label}</div>
-      <div className={`mt-1 text-2xl font-semibold tabular-nums ${accent ? "text-orange-400" : "text-white"}`}>
-        {value}
-      </div>
+      <div className="mt-1 text-2xl font-semibold tabular-nums text-white">{value}</div>
+      {hint && <div className="mt-1 text-[11px] text-zinc-500">{hint}</div>}
     </div>
   );
 }
 
 function StatusFunnel({ stats }: { stats: Stats }) {
-  const colors: Record<string, string> = {
-    INITIATED: "bg-zinc-500",
-    PROVING: "bg-sky-400",
-    ANCHORED: "bg-orange-400",
-    FINALIZED: "bg-emerald-400",
-    FAILED: "bg-red-500",
-    REORGED: "bg-red-700",
-  };
+  // One source of truth for status colors, shared with the table's status dots.
+  const colors: Record<string, string> = Object.fromEntries(
+    STATUSES.map((s) => [s, statusStyle(s).dot]),
+  );
   const counts: Record<string, number> = {
     INITIATED: stats.initiated,
     PROVING: stats.proving,
@@ -176,12 +183,15 @@ function StatusFunnel({ stats }: { stats: Stats }) {
         })}
       </div>
       <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-zinc-400">
-        {STATUSES.map((s) => (
-          <span key={s} className="inline-flex items-center gap-1.5">
-            <span className={`h-2 w-2 rounded-full ${colors[s]}`} />
-            {statusStyle(s).label} <span className="tabular-nums text-zinc-500">{counts[s] ?? 0}</span>
-          </span>
-        ))}
+        {STATUSES.map((s) => {
+          const n = counts[s] ?? 0;
+          return (
+            <span key={s} className={`inline-flex items-center gap-1.5 ${n === 0 ? "opacity-40" : ""}`}>
+              <span className={`h-2 w-2 rounded-full ${colors[s]}`} />
+              {statusStyle(s).label} <span className="tabular-nums text-zinc-500">{n}</span>
+            </span>
+          );
+        })}
       </div>
     </div>
   );

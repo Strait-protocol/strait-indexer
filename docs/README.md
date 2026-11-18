@@ -14,6 +14,7 @@ Technical reference for the Hemi tunnel ecosystem — contracts, events, Bitcoin
 | [eth-tunnel-guide.md](eth-tunnel-guide.md) | ETH/ERC-20 tunnel: L2StandardBridge events, deposit and withdrawal flows, code examples. |
 | [bitcoinkit-reference.md](bitcoinkit-reference.md) | BitcoinKit precompile cookbook — reading Bitcoin state from Hemi smart contracts, with Solidity and ethers.js examples. |
 | [pop-anchoring.md](pop-anchoring.md) | PoP anchoring and Bitcoin finality: how PoPPayoutsV2 works, keystone windows, how to verify a transaction is Bitcoin-final. |
+| [hemiprove.md](hemiprove.md) | hemiProve ZK proving marketplace: contracts, job lifecycle events, economics, the zk-miner, and a proposed Strait Proof Explorer roadmap. |
 | [api-integration.md](api-integration.md) | **For app developers:** integrate the Strait read API (GraphQL + REST) — the `Transfer` schema, queries, the transfer lifecycle, amounts, and code examples. |
 
 ---
