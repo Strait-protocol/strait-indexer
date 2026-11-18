@@ -51,7 +51,9 @@ single tunnel transfer.
 | `amount` | `amount` | String | **Atomic units** (satoshis or wei) as a plain decimal string. See [§5](#5-amounts). |
 | `sender` | `sender` | String | Origin address (EVM `0x…` or a Bitcoin address). See the `BTC_TO_HEMI` caveat in [§6](#6-field-caveats). |
 | `recipient` | `recipient` | String | Destination address. |
-| `status` | `status` | Enum | `INITIATED` \| `FINALIZED` \| `FAILED` \| `REORGED`. |
+| `assetDecimals` | `asset_decimals` | Int? | Decimals of `amount` (8 for BTC, 18 for ETH, the token's own for ERC-20s). `null` only for an ERC-20 whose decimals are unknown. |
+| `assetContract` | `asset_contract` | String? | ERC-20 contract address on the chain the event was observed on; `null` for native BTC / ETH. |
+| `status` | `status` | Enum | `INITIATED` \| `PROVING` \| `FINALIZED` \| `FAILED` \| `REORGED`. `ANCHORED` exists in the enum but is reserved and not currently set. See [§3](#3-the-transfer-lifecycle). |
 | `sourceChain` | `source_chain` | Enum | `BITCOIN` \| `HEMI` \| `ETHEREUM`. |
 | `sourceTxHash` | `source_tx_hash` | String | Tx hash on the source chain. |
 | `sourceBlock` | `source_block` | Int | Source block height (`0` = source leg not yet observed; see [§6](#6-field-caveats)). |
@@ -59,6 +61,10 @@ single tunnel transfer.
 | `destChain` | `dest_chain` | Enum? | Destination chain, or `null` if not yet known. |
 | `destTxHash` | `dest_tx_hash` | String? | Destination tx hash, or `null`. |
 | `destBlock` | `dest_block` | Int? | Destination block height, or `null`. |
+| `sourceFee` | `source_fee` | String? | Network fee on the source leg, atomic units (wei or sats), or `null`. |
+| `destFee` | `dest_fee` | String? | Network fee on the destination leg, atomic units (wei or sats), or `null`. |
+| `withdrawalHash` | `withdrawal_hash` | String? | `HEMI_TO_ETH` only: the OP Stack withdrawal hash (from Hemi's `MessagePassed` log), the key Ethereum's `OptimismPortal` proves and finalizes by. |
+| `provenAt` | `proven_at` | DateTime? | `HEMI_TO_ETH` only: when the withdrawal was proven on Ethereum. |
 | `popAnchored` | `pop_anchored` | Bool | Whether the transfer is PoP-anchored to Bitcoin. |
 | `popKeystoneBlock` | `pop_keystone_block` | Int? | Hemi keystone block (multiple of 25) that anchored it. |
 | `popScore` | `pop_score` | Int? | Aggregate PoP score of the anchoring keystone. |
@@ -217,7 +223,10 @@ These reflect what is reliably populated **today**:
   this automatically, and an un-proven withdrawal waits indefinitely, not just ~1 day),
   then Hemi's ~1 day challenge window elapses (shortened from the standard OP Stack
   7 days by anchoring finality to Bitcoin via PoP) before `finalizeWithdrawalTransaction`
-  releases the funds.
+  releases the funds. Strait tracks both steps by the transfer's `withdrawalHash`: it
+  reads `OptimismPortal.provenWithdrawals` (→ `PROVING`, sets `provenAt`) and matches the
+  portal's `WithdrawalFinalized` log (→ `FINALIZED`, with the claim tx as the
+  destination leg; → `FAILED` if the relay reverted).
 
 ---
 

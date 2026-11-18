@@ -164,11 +164,15 @@ does not start until step 2 happens, so an un-proven withdrawal can sit indefini
    → ETHBridgeFinalized event emitted on L1StandardBridgeProxy; funds released.
 ```
 
-**Indexer note:** Strait watches `WithdrawalProven` on `OptimismPortal` (when
-`ETH_OPT_PORTAL_CONTRACT` is configured) to advance a withdrawal from `INITIATED` to
-`PROVING`, and `ETHBridgeFinalized` on L1 to advance `PROVING` → `FINALIZED`. Strait does
-not submit the proof itself — today this is a manual step for the withdrawing user (or
-a relayer acting on their behalf).
+**Indexer note:** Strait tracks each Hemi → ETH withdrawal by its `withdrawalHash` (from
+the Hemi `MessagePassed` log), not by matching addresses or amounts. When
+`ETH_OPT_PORTAL_CONTRACT` is configured, a reconciler reads
+`OptimismPortal.provenWithdrawals(hash)` to advance `INITIATED` → `PROVING`, and
+`finalizedWithdrawals(hash)` plus the portal's `WithdrawalFinalized` log to advance
+`PROVING` → `FINALIZED` (or `FAILED` if the relay reverted). Finding the claim block uses
+a binary search over historical state, so the Ethereum RPC must serve archive reads.
+Strait does not submit the proof itself — today this is a manual step for the
+withdrawing user (or a relayer acting on their behalf).
 
 ### Events to index
 
