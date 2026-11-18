@@ -93,20 +93,6 @@ export default async function TransferDetailPage({
                 {t.popScore != null && <> · PoP score {t.popScore.toLocaleString()}</>}. This transfer carries
                 Bitcoin-grade finality, not just Hemi consensus.
               </span>
-              {t.popBitcoinTxid && (
-                <div className="mt-2 text-zinc-400">
-                  Proof: published in Bitcoin tx{" "}
-                  <a
-                    href={txExplorerUrl("BITCOIN", t.popBitcoinTxid, network) ?? "#"}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-mono text-orange-300 hover:text-orange-200 underline decoration-orange-500/40"
-                  >
-                    {shortHash(t.popBitcoinTxid)}
-                  </a>
-                  {t.popBitcoinBlock != null && <> in block {t.popBitcoinBlock.toLocaleString()}</>}.
-                </div>
-              )}
             </div>
           )}
         </section>
