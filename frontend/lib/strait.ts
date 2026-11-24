@@ -96,6 +96,9 @@ const TRANSFER_FIELDS = `
   initiatedAt finalizedAt
 `;
 
+/** How long the frontend server reuses an identical API response. */
+const API_CACHE_SECONDS = 15;
+
 /** Run a GraphQL query against the Strait node. Returns null on any failure so
  *  pages can render an "indexer offline" state instead of crashing. */
 export async function graphql<T>(
@@ -108,7 +111,9 @@ export async function graphql<T>(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ query, variables }),
-      cache: "no-store",
+      // Share responses across viewers for a few seconds: every dashboard
+      // refresh would otherwise hit the API once per open tab.
+      next: { revalidate: API_CACHE_SECONDS },
       signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) return null;
