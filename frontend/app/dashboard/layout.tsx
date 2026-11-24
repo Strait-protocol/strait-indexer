@@ -9,14 +9,14 @@ export default function DashboardLayout({
 }) {
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white font-sans">
-      <AutoRefresh seconds={10} />
+      <AutoRefresh seconds={30} />
       <NavBar
         extras={
           <>
             <NetworkSwitcher />
             <span
               className="inline-flex items-center gap-2 text-zinc-400"
-              title="Auto-refreshes every 10s"
+              title="Auto-refreshes every 30s while this tab is visible"
             >
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
               live
